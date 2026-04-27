@@ -52,7 +52,9 @@ describe("public room flow", () => {
 
     const a = await fetch(`${base}/r/${room.slug}/AGENTS.md`);
     expect(a.status).toBe(200);
-    expect((await a.text()).toLowerCase()).toContain("prompt-injection");
+    const aText = (await a.text()).toLowerCase();
+    expect(aText).toContain("untrusted");
+    expect(aText).toContain("unauthenticated");
 
     const html = await fetch(`${base}/r/${room.slug}`);
     expect(html.status).toBe(200);
@@ -177,6 +179,18 @@ describe("two-client conversation", () => {
     const list = await fetch(`${url}/messages.json`).then(j as any);
     expect(list.messages.length).toBe(5);
     expect(list.messages.map((m: any) => m.from)).toEqual(["alice","bob","alice","bob","alice"]);
+  });
+});
+
+describe("cache headers", () => {
+  it("sets no-store on message feeds and AGENTS.md", async () => {
+    const room = await fetch(base + "/", { method: "POST" }).then(j as any);
+    const r1 = await fetch(`${base}/r/${room.slug}/messages.json`);
+    expect(r1.headers.get("cache-control") || "").toContain("no-store");
+    const r2 = await fetch(`${base}/r/${room.slug}/AGENTS.md`);
+    expect(r2.headers.get("cache-control") || "").toContain("no-store");
+    const r3 = await fetch(`${base}/AGENTS.md`);
+    expect(r3.headers.get("cache-control") || "").toContain("no-store");
   });
 });
 

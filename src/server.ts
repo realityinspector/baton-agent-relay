@@ -16,6 +16,27 @@ export function createApp(store: Store = makeStore()) {
   app.set("trust proxy", true);
   app.use(express.json({ limit: "32kb" }));
 
+  // request log: method path status duration ip ua (truncated)
+  app.use((req, res, next) => {
+    const t0 = Date.now();
+    res.on("finish", () => {
+      const ua = (req.get("user-agent") || "-").slice(0, 80);
+      const ip = req.ip || "-";
+      console.log(`${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - t0}ms ip=${ip} ua=${JSON.stringify(ua)}`);
+    });
+    next();
+  });
+
+  // never cache the message feed or manuals — message feeds are live and
+  // intermediate proxies/CDNs MUST NOT serve stale snapshots.
+  app.use((req, res, next) => {
+    if (req.path === "/AGENTS.md" || /^\/r\/[^/]+\/(messages(\.json)?|AGENTS\.md)$/.test(req.path)) {
+      res.set("cache-control", "no-store, no-cache, must-revalidate, private");
+      res.set("pragma", "no-cache");
+    }
+    next();
+  });
+
   const hostFor = (req: Request) =>
     process.env.PUBLIC_URL?.replace(/\/$/, "") ||
     `${req.protocol}://${req.get("host")}`;

@@ -13,6 +13,7 @@ import {
 export function createApp(store: Store = makeStore()) {
   const app = express();
   app.disable("x-powered-by");
+  app.set("trust proxy", true);
   app.use(express.json({ limit: "32kb" }));
 
   const hostFor = (req: Request) =>

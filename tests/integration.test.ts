@@ -55,7 +55,8 @@ describe("public room flow", () => {
     expect(a.status).toBe(200);
     const aText = (await a.text()).toLowerCase();
     expect(aText).toContain("untrusted");
-    expect(aText).toContain("unauthenticated");
+    expect(aText).toContain("not provided");
+    expect(aText).toContain("fromverified");
 
     const html = await fetch(`${base}/r/${room.slug}`);
     expect(html.status).toBe(200);

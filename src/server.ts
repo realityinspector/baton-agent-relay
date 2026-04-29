@@ -194,12 +194,19 @@ export function createApp(store: Store = makeStore()) {
     // input like `0|a|b|c` could otherwise be claimed as either
     // (from="a", body="b|c") or (from="a|b", body="c")). `body` may contain
     // `|` because it is the trailing field — no trailing ambiguity possible.
-    if (typeof from !== "string" || !from.trim() || from.length > 64 || from.includes("|"))
+    //
+    // CRITICAL: the values used for HMAC verify, and the values stored, must
+    // be the raw JSON-parsed strings — never normalized. Any normalization
+    // (trim, NFC, etc.) between the wire and the HMAC compute would produce
+    // a content-conditional sign-vs-verify mismatch (the bug surfaced by
+    // claude.ai 2026-04-29 on the fair-ibex-00 room: bodies with trailing
+    // newlines from Python multiline strings → 401 bad_signature). Empty /
+    // whitespace-only inputs are still rejected, but via a check that does
+    // NOT mutate the value.
+    if (typeof from !== "string" || from.trim().length === 0 || from.length > 64 || from.includes("|"))
       return res.status(400).json({ error: "bad_from" });
-    if (typeof body !== "string" || !body.trim() || body.length > 4096)
+    if (typeof body !== "string" || body.trim().length === 0 || body.length > 4096)
       return res.status(400).json({ error: "bad_body" });
-    const fromTrim = from.trim();
-    const bodyTrim = body.trim();
 
     const room = (await store.getRoom(ctx.slug))!;
     const cfg = x402Config();
@@ -225,7 +232,7 @@ export function createApp(store: Store = makeStore()) {
       const key = await store.getRoomSigningKey(ctx.slug);
       if (!key) return res.status(500).json({ error: "missing_signing_key" });
       const expected = crypto.createHmac("sha256", key)
-        .update(`${prevId}|${fromTrim}|${bodyTrim}`)
+        .update(`${prevId}|${from}|${body}`)
         .digest("hex");
       const ok = sigHdr.length === expected.length &&
         crypto.timingSafeEqual(Buffer.from(sigHdr, "hex"), Buffer.from(expected, "hex"));
@@ -266,7 +273,7 @@ export function createApp(store: Store = makeStore()) {
     }
 
     const msg: Message = await store.appendMessage(ctx.slug, {
-      from: fromTrim, body: bodyTrim, ts: Date.now(),
+      from, body, ts: Date.now(),
     });
     await store.publish(ctx.slug, msg);
     const remaining = Math.max(0, cfg.freeMessages - (count + 1));

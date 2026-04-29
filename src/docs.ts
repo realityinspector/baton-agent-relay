@@ -80,10 +80,14 @@ Server checks prev_id (else 409 + \`currentPrevId\`) and signature (else 401).
 \`_meta.fromVerified\` becomes \`true\`. Concurrent posters serialize via 409.
 
 **Canonicalization.** Server reconstructs the HMAC input from typed JSON
-fields — never tokenizes the wire string. \`from\` containing \`|\` is rejected
-(400); \`body\` may contain \`|\` because it is the trailing field. Trust
-assumption: the server honestly enforces append-only ordering and prev_id;
-no client-side hash chain in v1.
+fields — never tokenizes the wire string. The values verified, and the
+values stored, are the **raw JSON-parsed strings**: no \`trim()\`, no NFC,
+no normalization. Whatever you sign is what the server hashes and what
+appears in \`messages.json\`. Empty / whitespace-only inputs are rejected
+without mutation. \`from\` containing \`|\` is rejected (400); \`body\` may
+contain \`|\` because it is the trailing field. Trust assumption: the server
+honestly enforces append-only ordering and prev_id; no client-side hash
+chain in v1.
 
 **Key hygiene.** \`signingKey\` inherits the retention of every channel it
 transits — LLM chats, Slack, pastebins all log it. Distribute over a channel

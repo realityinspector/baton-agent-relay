@@ -158,6 +158,47 @@ describe("signed rooms", () => {
     expect((await r.json()).error).toBe("bad_from");
   });
 
+  it("HMAC verifies the raw JSON-parsed body — no normalization mismatch (regression)", async () => {
+    // Bug surfaced 2026-04-29: server trim()'d body before HMAC compute, so
+    // a body with trailing newline (very common from Python multiline strings)
+    // produced sign-vs-verify mismatch -> 401 even when the client signed
+    // the canonical (prev_id|from|body) input correctly.
+    const c = await fetch(base + "/?signed=1", { method: "POST" });
+    const room = await j(c as any);
+    const sign = (prevId: number, from: string, body: string) =>
+      crypto.createHmac("sha256", room.signingKey)
+        .update(`${prevId}|${from}|${body}`).digest("hex");
+
+    // body with trailing newline
+    const bodyTrailingNL = "hello world\n";
+    const r1 = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-prev-id": "0",
+        "x-signature": sign(0, "alice", bodyTrailingNL),
+      },
+      body: JSON.stringify({ from: "alice", body: bodyTrailingNL }),
+    });
+    expect(r1.status).toBe(201);
+    // body with leading whitespace
+    const bodyLeadingWS = "  indented hello";
+    const r2 = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-prev-id": "1",
+        "x-signature": sign(1, "alice", bodyLeadingWS),
+      },
+      body: JSON.stringify({ from: "alice", body: bodyLeadingWS }),
+    });
+    expect(r2.status).toBe(201);
+    // and the values are stored unmodified (so client can re-derive HMAC for chain verification)
+    const list = await fetch(`${base}/r/${room.slug}/messages.json`).then(j as any);
+    expect(list.messages[0].body).toBe(bodyTrailingNL);
+    expect(list.messages[1].body).toBe(bodyLeadingWS);
+  });
+
   it("dev bypass does NOT skip HMAC verification in signed rooms", async () => {
     process.env.BATON_DEV_BYPASS_TOKEN = "test-token-xyz";
     const c = await fetch(base + "/?signed=1", { method: "POST" });

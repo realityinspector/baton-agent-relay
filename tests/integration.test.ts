@@ -137,6 +137,42 @@ describe("signed rooms", () => {
     expect(list._meta.auth).toBe("hmac");
     expect(list._meta.fromVerified).toBe(true);
   });
+
+  it("rejects from values containing | (HMAC canonicalization guard)", async () => {
+    const c = await fetch(base + "/?signed=1", { method: "POST" });
+    const room = await j(c as any);
+    const sign = (prevId: number, from: string, body: string) =>
+      crypto.createHmac("sha256", room.signingKey)
+        .update(`${prevId}|${from}|${body}`).digest("hex");
+    const r = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-prev-id": "0",
+        "x-signature": sign(0, "a|b", "c"),
+      },
+      body: JSON.stringify({ from: "a|b", body: "c" }),
+    });
+    expect(r.status).toBe(400);
+    expect((await r.json()).error).toBe("bad_from");
+  });
+
+  it("dev bypass does NOT skip HMAC verification in signed rooms", async () => {
+    process.env.BATON_DEV_BYPASS_TOKEN = "test-token-xyz";
+    const c = await fetch(base + "/?signed=1", { method: "POST" });
+    const room = await j(c as any);
+    // Try to post with dev bypass header but NO valid X-Signature
+    const r = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-payment": "dev:test-token-xyz:nonce-x",
+      },
+      body: JSON.stringify({ from: "a", body: "hi" }),
+    });
+    expect(r.status).toBe(401); // HMAC check runs before quota/dev-bypass
+    delete process.env.BATON_DEV_BYPASS_TOKEN;
+  });
 });
 
 describe("quota soft-warn", () => {

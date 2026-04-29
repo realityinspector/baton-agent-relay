@@ -187,7 +187,14 @@ export function createApp(store: Store = makeStore()) {
       return res.status(429).json({ error: "rate_limited" });
 
     const { from, body } = (req.body || {}) as { from?: string; body?: string };
-    if (typeof from !== "string" || !from.trim() || from.length > 64)
+    // `from` cannot contain `|` because it appears between two pipe-delimited
+    // fields in the signed-room HMAC input (`${prev_id}|${from}|${body}`).
+    // Server reconstructs the input from typed fields and never tokenizes,
+    // but disallowing `|` in `from` removes the equivalence ambiguity (an
+    // input like `0|a|b|c` could otherwise be claimed as either
+    // (from="a", body="b|c") or (from="a|b", body="c")). `body` may contain
+    // `|` because it is the trailing field — no trailing ambiguity possible.
+    if (typeof from !== "string" || !from.trim() || from.length > 64 || from.includes("|"))
       return res.status(400).json({ error: "bad_from" });
     if (typeof body !== "string" || !body.trim() || body.length > 4096)
       return res.status(400).json({ error: "bad_body" });

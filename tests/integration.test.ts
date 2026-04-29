@@ -135,7 +135,7 @@ describe("signed rooms", () => {
 
     // envelope reflects signed
     const list = await fetch(`${base}/r/${room.slug}/messages.json`).then(j as any);
-    expect(list._meta.auth).toBe("hmac");
+    expect(list._meta.auth).toBe("hmac-shared");
     expect(list._meta.fromVerified).toBe(true);
   });
 
@@ -214,6 +214,228 @@ describe("signed rooms", () => {
     });
     expect(r.status).toBe(401); // HMAC check runs before quota/dev-bypass
     delete process.env.BATON_DEV_BYPASS_TOKEN;
+  });
+});
+
+describe("idempotency", () => {
+  it("replays the recorded response on retry; doesn't double-post", async () => {
+    const room = await fetch(base + "/", { method: "POST" }).then(j as any);
+    const k = `idem-${Date.now()}`;
+    const post = () => fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-idempotency-key": k },
+      body: JSON.stringify({ from: "alice", body: "once" }),
+    });
+    const r1 = await post();
+    expect(r1.status).toBe(201);
+    const j1 = await r1.json();
+    const r2 = await post();
+    expect(r2.status).toBe(201);
+    expect(r2.headers.get("x-baton-idempotent-replay")).toBe("true");
+    const j2 = await r2.json();
+    expect(j2.message.id).toBe(j1.message.id); // same id, no double-post
+    const list = await fetch(`${base}/r/${room.slug}/messages.json`).then(j as any);
+    expect(list.messages.length).toBe(1);
+  });
+});
+
+describe("reply_to", () => {
+  it("accepts valid reply_to; rejects future-id", async () => {
+    const room = await fetch(base + "/", { method: "POST" }).then(j as any);
+    await fetch(`${base}/r/${room.slug}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ from: "a", body: "first" }),
+    });
+    const r = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ from: "b", body: "reply", reply_to: 1 }),
+    });
+    expect(r.status).toBe(201);
+    expect((await r.json()).message.reply_to).toBe(1);
+    const r2 = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ from: "b", body: "future", reply_to: 99 }),
+    });
+    expect(r2.status).toBe(400);
+    expect((await r2.json()).error).toBe("reply_to_future_message");
+  });
+});
+
+describe("hash chain", () => {
+  it("each signed-room message links to the prior via prev_hash; chain is verifiable", async () => {
+    const c = await fetch(base + "/?signed=1", { method: "POST" });
+    const room = await j(c as any);
+    const sign = (prevId: number, from: string, body: string) =>
+      crypto.createHmac("sha256", room.signingKey)
+        .update(`${prevId}|${from}|${body}`).digest("hex");
+    const post = (prevId: number, from: string, body: string) => fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-prev-id": String(prevId),
+        "x-signature": sign(prevId, from, body),
+      },
+      body: JSON.stringify({ from, body }),
+    });
+    const r1 = await post(0, "a", "one");
+    const m1 = (await r1.json()).message;
+    const r2 = await post(1, "a", "two");
+    const m2 = (await r2.json()).message;
+    expect(m1.prev_hash).toBe("");
+    expect(m1.hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(m2.prev_hash).toBe(m1.hash);
+    // verify chain client-side
+    const recomputed1 = crypto.createHash("sha256").update(`|1|a|one`).digest("hex");
+    const recomputed2 = crypto.createHash("sha256").update(`${m1.hash}|2|a|two`).digest("hex");
+    expect(m1.hash).toBe(recomputed1);
+    expect(m2.hash).toBe(recomputed2);
+  });
+});
+
+describe("attest mode (ed25519 + TOFU)", () => {
+  it("first pubkey for `from` locks; mismatched pubkey rejected; ed25519 sig verified", async () => {
+    const c = await fetch(base + "/?attest=1", { method: "POST" });
+    const room = await j(c as any);
+    expect(room.attest).toBe(true);
+    expect(room.signed).toBe(false);
+    expect(room.signingKey).toBeUndefined();
+
+    // generate two ed25519 keypairs
+    const { publicKey: pkA, privateKey: skA } = crypto.generateKeyPairSync("ed25519");
+    const { publicKey: pkB, privateKey: skB } = crypto.generateKeyPairSync("ed25519");
+    const rawPk = (k: crypto.KeyObject) => k.export({ format: "der", type: "spki" }).slice(-32).toString("hex");
+    const pkAHex = rawPk(pkA);
+    const pkBHex = rawPk(pkB);
+
+    const post = (prevId: number, prevHash: string, from: string, body: string, sk: crypto.KeyObject, pkHex: string) => {
+      const canonical = `${prevHash}|${prevId}|${from}|${body}`;
+      const sig = crypto.sign(null, Buffer.from(canonical), sk).toString("hex");
+      return fetch(`${base}/r/${room.slug}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-prev-id": String(prevId),
+          "x-pubkey": pkHex,
+          "x-signature": sig,
+        },
+        body: JSON.stringify({ from, body }),
+      });
+    };
+
+    const r1 = await post(0, "", "alice", "hi", skA, pkAHex);
+    expect(r1.status).toBe(201);
+    const m1 = (await r1.json()).message;
+    expect(m1.pubkey).toBe(pkAHex);
+    expect(m1.hash).toMatch(/^[0-9a-f]{64}$/);
+
+    // try to post as alice using bob's key -> 401 pubkey_mismatch
+    const r2 = await post(1, m1.hash, "alice", "spoof", skB, pkBHex);
+    expect(r2.status).toBe(401);
+    expect((await r2.json()).error).toBe("pubkey_mismatch");
+
+    // bob can post under his own name with his key
+    const r3 = await post(1, m1.hash, "bob", "hi-back", skB, pkBHex);
+    expect(r3.status).toBe(201);
+  });
+});
+
+describe("derived keys (macaroon-style)", () => {
+  it("issues a derived key with caveats; enforces fromPrefix and maxUses", async () => {
+    const c = await fetch(base + "/?signed=1", { method: "POST" });
+    const room = await j(c as any);
+    const dr = await fetch(`${base}/r/${room.slug}/derive`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ signingKey: room.signingKey, maxUses: 2, fromPrefix: "worker-" }),
+    });
+    expect(dr.status).toBe(201);
+    const { derivedKey } = await dr.json();
+    expect(derivedKey).toMatch(/^d_/);
+
+    const sign = (key: string, prevId: number, from: string, body: string) =>
+      crypto.createHmac("sha256", key)
+        .update(`${prevId}|${from}|${body}`).digest("hex");
+
+    // post as worker-1 (allowed by prefix)
+    const r1 = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-prev-id": "0",
+        "x-signing-key-id": derivedKey,
+        "x-signature": sign(derivedKey, 0, "worker-1", "hi"),
+      },
+      body: JSON.stringify({ from: "worker-1", body: "hi" }),
+    });
+    expect(r1.status).toBe(201);
+
+    // post as alice (violates prefix) -> 403
+    const r2 = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-prev-id": "1",
+        "x-signing-key-id": derivedKey,
+        "x-signature": sign(derivedKey, 1, "alice", "hi"),
+      },
+      body: JSON.stringify({ from: "alice", body: "hi" }),
+    });
+    expect(r2.status).toBe(403);
+    expect((await r2.json()).error).toBe("from_prefix_violation");
+
+    // second use ok, third should fail maxUses
+    const r3 = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-prev-id": "1",
+        "x-signing-key-id": derivedKey,
+        "x-signature": sign(derivedKey, 1, "worker-2", "hi"),
+      },
+      body: JSON.stringify({ from: "worker-2", body: "hi" }),
+    });
+    expect(r3.status).toBe(201);
+    const r4 = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-prev-id": "2",
+        "x-signing-key-id": derivedKey,
+        "x-signature": sign(derivedKey, 2, "worker-3", "hi"),
+      },
+      body: JSON.stringify({ from: "worker-3", body: "hi" }),
+    });
+    expect(r4.status).toBe(401);
+    expect((await r4.json()).error).toBe("derived_key_max_uses_exceeded");
+  });
+});
+
+describe("long-poll", () => {
+  it("returns immediately when messages exist; blocks then resolves on new message", async () => {
+    const room = await fetch(base + "/", { method: "POST" }).then(j as any);
+    // first call: empty; should block ~200ms then resolve when a write lands
+    const t0 = Date.now();
+    const longPoll = fetch(`${base}/r/${room.slug}/messages.json?since=0&wait=2`).then(j as any);
+    setTimeout(() => {
+      fetch(`${base}/r/${room.slug}`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ from: "x", body: "wake-up" }),
+      });
+    }, 150);
+    const result = await longPoll;
+    const elapsed = Date.now() - t0;
+    expect(result.messages.length).toBe(1);
+    expect(elapsed).toBeLessThan(2000); // resolved before timeout
+    expect(elapsed).toBeGreaterThan(100); // actually waited
+  });
+
+  it("times out cleanly when no new message arrives", async () => {
+    const room = await fetch(base + "/", { method: "POST" }).then(j as any);
+    const t0 = Date.now();
+    const result = await fetch(`${base}/r/${room.slug}/messages.json?since=0&wait=1`).then(j as any);
+    const elapsed = Date.now() - t0;
+    expect(result.messages.length).toBe(0);
+    expect(elapsed).toBeGreaterThanOrEqual(1000);
   });
 });
 

@@ -1,6 +1,6 @@
 import express, { Request, Response, NextFunction } from "express";
 import crypto from "node:crypto";
-import { makeStore, Store, Message } from "./store.js";
+import { makeStore, Store, Message, Room } from "./store.js";
 import { randomSlug, SLUG_RE } from "./slugs.js";
 import { landingHtml, roomHtml, rootAgentsMd, roomAgentsMd } from "./docs.js";
 import {
@@ -71,18 +71,26 @@ export function createApp(store: Store = makeStore()) {
   app.post("/", async (req, res) => {
     const isPrivate = req.query.private === "1" || req.query.private === "true";
     const isSigned = req.query.signed === "1" || req.query.signed === "true";
+    const isAttest = req.query.attest === "1" || req.query.attest === "true";
+    if (isAttest && isSigned)
+      return res.status(400).json({ error: "attest_and_signed_are_mutually_exclusive" });
     const secret = isPrivate ? crypto.randomBytes(24).toString("base64url") : undefined;
     const signingKey = isSigned ? crypto.randomBytes(32).toString("base64url") : undefined;
 
     let slug = "", attempts = 0;
     while (attempts++ < 16) {
       slug = randomSlug();
-      try { await store.createRoom(slug, isPrivate, isSigned, secret, signingKey); break; }
+      try { await store.createRoom(slug, isPrivate, isSigned, isAttest, secret, signingKey); break; }
       catch { slug = ""; }
     }
     if (!slug) return res.status(500).json({ error: "slug_exhausted" });
 
     const host = hostFor(req);
+    const authNote = isAttest
+      ? "attest: every post must include X-Pubkey (ed25519 hex) and X-Signature (ed25519 sig over `${prev_hash}|${prev_id}|${from}|${body}`, hex). Server enforces TOFU: first pubkey seen for a given `from` is locked in for the room. Each message is hash-chained."
+      : isSigned
+        ? "signed: posts must include X-Signature = HMAC-SHA256(signingKey, `${prev_id}|${from}|${body}`) and header X-Prev-Id = current message count. unsigned posts are rejected. messages are hash-chained."
+        : "from is unauthenticated; anyone with this URL can post under any name. use ?signed=1 (shared HMAC) or ?attest=1 (per-party ed25519) for verified authorship.";
     const body: Record<string, unknown> = {
       slug,
       url: `${host}/r/${slug}`,
@@ -90,14 +98,50 @@ export function createApp(store: Store = makeStore()) {
       messagesUrl: `${host}/r/${slug}/messages`,
       private: isPrivate,
       signed: isSigned,
+      attest: isAttest,
       freeMessages: x402Config().freeMessages,
-      authNote: isSigned
-        ? "signed: posts must include X-Signature = HMAC-SHA256(signingKey, `${prev_id}|${from}|${body}`) and header X-Prev-Id = current message count. unsigned posts are rejected."
-        : "from is unauthenticated; anyone with this URL can post under any name. use ?signed=1 for HMAC-verified posts.",
+      authNote,
     };
     if (secret) body.secret = secret;
     if (signingKey) body.signingKey = signingKey;
     res.status(201).json(body);
+  });
+
+  // --- derive a constrained write capability from a signed-room signingKey ---
+  // POST /r/:slug/derive  body: { signingKey, expiresInSec?, maxUses?, fromPrefix? }
+  // Returns: { derivedKey, caveats }. Use derivedKey in place of signingKey
+  // for HMAC verification on POSTs; server enforces all caveats on each use.
+  app.post("/r/:slug/derive", async (req, res) => {
+    const slug = req.params.slug;
+    if (!SLUG_RE.test(slug)) return res.status(400).json({ error: "bad_slug" });
+    const room = await store.getRoom(slug);
+    if (!room || !room.signed) return res.status(404).json({ error: "not_signed_room" });
+    const masterKey = await store.getRoomSigningKey(slug);
+    if (!masterKey) return res.status(404).json({ error: "no_signing_key" });
+    const presented = (req.body || {}).signingKey;
+    if (typeof presented !== "string" || presented !== masterKey)
+      return res.status(401).json({ error: "must_present_master_signingkey" });
+
+    const expiresInSec = Math.max(0, Number((req.body || {}).expiresInSec || 0) | 0);
+    const maxUses = Math.max(0, Number((req.body || {}).maxUses || 0) | 0);
+    const fromPrefix = String((req.body || {}).fromPrefix || "");
+    if (fromPrefix.length > 64 || fromPrefix.includes("|"))
+      return res.status(400).json({ error: "bad_from_prefix" });
+
+    const caveats = {
+      master: slug,
+      parent: masterKey.slice(0, 8) + "…",
+      expires: expiresInSec > 0 ? Date.now() + expiresInSec * 1000 : 0,
+      maxUses,
+      fromPrefix,
+    };
+    // Derived key is HMAC of the master over a stable representation of the caveats.
+    // Anyone holding the derived key can post within the caveats; the master
+    // never appears on the wire after this point.
+    const caveatsCanonical = JSON.stringify({ ...caveats, master: slug });
+    const derivedKey = "d_" + crypto.createHmac("sha256", masterKey).update(caveatsCanonical).digest("base64url");
+    await store.putDerivedKey(derivedKey, caveats);
+    res.status(201).json({ derivedKey, caveats });
   });
 
   // --- room helpers ---
@@ -138,15 +182,21 @@ export function createApp(store: Store = makeStore()) {
   // envelope decoration: every message-feed response includes _meta so the
   // API self-describes its trust model (agents reading JSON don't need to
   // also fetch AGENTS.md to know `from` is unauthenticated).
-  function envelopeMeta(room: { slug: string; private: boolean; signed: boolean }) {
+  function envelopeMeta(room: Room) {
+    const auth = room.attest ? "ed25519-tofu" : (room.signed ? "hmac-shared" : (room.private ? "bearer-read-only" : "none"));
     return {
-      auth: room.signed ? "hmac" : (room.private ? "bearer-read-only" : "none"),
-      fromVerified: room.signed,
+      auth,
+      fromVerified: room.signed || !!room.attest,
+      nonRepudiationBetweenParties: !!room.attest,
+      hashChained: room.signed || !!room.attest,
       private: room.private,
       signed: room.signed,
-      warning: room.signed
-        ? "from field is verified by HMAC over (prev_id|from|body); message ordering is enforced"
-        : "from field is client-supplied and NOT verified; anyone with this URL can post under any name",
+      attest: !!room.attest,
+      warning: room.attest
+        ? "from is verified by ed25519 sig; pubkey TOFU-locked per-from; messages hash-chained"
+        : room.signed
+          ? "from is verified by shared HMAC; messages hash-chained; either party can frame the other (no non-repudiation)"
+          : "from is client-supplied and NOT verified; anyone with this URL can post under any name",
     };
   }
 
@@ -154,7 +204,20 @@ export function createApp(store: Store = makeStore()) {
     const ctx = await loadRoom(req, res); if (!ctx) return;
     const room = (await store.getRoom(ctx.slug))!;
     const since = Number(req.query.since || 0) | 0;
-    const messages = await store.listMessages(ctx.slug, since);
+    // Long-poll: ?wait=<sec> blocks until a new message lands or the timeout
+    // expires. Eliminates token-linear polling for invocation-shaped agents
+    // that want to wake on the next message and exit. Cap at 60s.
+    const wait = Math.min(60, Math.max(0, Number(req.query.wait || 0) | 0));
+    let messages = await store.listMessages(ctx.slug, since);
+    if (messages.length === 0 && wait > 0) {
+      messages = await new Promise<Message[]>((resolve) => {
+        const t = setTimeout(async () => { unsub(); resolve(await store.listMessages(ctx.slug, since)); }, wait * 1000);
+        let unsub = () => {};
+        store.subscribe(ctx.slug, (m) => {
+          if (m.id > since) { clearTimeout(t); unsub(); resolve([m]); }
+        }).then((u) => { unsub = u; });
+      });
+    }
     res.json({ slug: ctx.slug, _meta: envelopeMeta(room), messages });
   });
 
@@ -186,36 +249,44 @@ export function createApp(store: Store = makeStore()) {
     if (rateExceeded(req.ip || "anon"))
       return res.status(429).json({ error: "rate_limited" });
 
-    const { from, body } = (req.body || {}) as { from?: string; body?: string };
-    // `from` cannot contain `|` because it appears between two pipe-delimited
-    // fields in the signed-room HMAC input (`${prev_id}|${from}|${body}`).
-    // Server reconstructs the input from typed fields and never tokenizes,
-    // but disallowing `|` in `from` removes the equivalence ambiguity (an
-    // input like `0|a|b|c` could otherwise be claimed as either
-    // (from="a", body="b|c") or (from="a|b", body="c")). `body` may contain
-    // `|` because it is the trailing field — no trailing ambiguity possible.
-    //
-    // CRITICAL: the values used for HMAC verify, and the values stored, must
-    // be the raw JSON-parsed strings — never normalized. Any normalization
-    // (trim, NFC, etc.) between the wire and the HMAC compute would produce
-    // a content-conditional sign-vs-verify mismatch (the bug surfaced by
-    // claude.ai 2026-04-29 on the fair-ibex-00 room: bodies with trailing
-    // newlines from Python multiline strings → 401 bad_signature). Empty /
-    // whitespace-only inputs are still rejected, but via a check that does
-    // NOT mutate the value.
+    const { from, body, reply_to } = (req.body || {}) as { from?: string; body?: string; reply_to?: number };
+    // `from` cannot contain `|` (HMAC canonicalization). Values used for
+    // HMAC verify and storage are raw JSON-parsed strings, never normalized.
     if (typeof from !== "string" || from.trim().length === 0 || from.length > 64 || from.includes("|"))
       return res.status(400).json({ error: "bad_from" });
     if (typeof body !== "string" || body.trim().length === 0 || body.length > 4096)
       return res.status(400).json({ error: "bad_body" });
+    if (reply_to !== undefined && (typeof reply_to !== "number" || !Number.isInteger(reply_to) || reply_to < 1))
+      return res.status(400).json({ error: "bad_reply_to" });
 
     const room = (await store.getRoom(ctx.slug))!;
     const cfg = x402Config();
     const count = await store.messageCount(ctx.slug);
 
-    // Signed-room HMAC verification. Client must send:
-    //   X-Prev-Id:    current message count (= id of last message, 0 if none)
-    //   X-Signature:  hex(HMAC_SHA256(signingKey, `${prev_id}|${from}|${body}`))
-    // Mismatch on prev_id -> 409 (concurrent write); mismatch on sig -> 401.
+    if (reply_to !== undefined && reply_to > count)
+      return res.status(400).json({ error: "reply_to_future_message", currentCount: count });
+
+    // Idempotency: if the client sends X-Idempotency-Key (recommended for
+    // any retry-on-503 path), the recorded response is replayed verbatim
+    // within the TTL window so retries can't double-post. Scope: per-room.
+    // TTL: 5 min. Concurrent retries both do work; first to record wins.
+    const idemKey = req.header("x-idempotency-key");
+    if (idemKey) {
+      if (typeof idemKey !== "string" || idemKey.length > 128)
+        return res.status(400).json({ error: "bad_idempotency_key" });
+      const stored = await store.getIdempotency(ctx.slug, idemKey);
+      if (stored) {
+        try {
+          const replay = JSON.parse(stored);
+          res.set("x-baton-idempotent-replay", "true");
+          return res.status(replay.status).json(replay.body);
+        } catch { /* corrupt entry; fall through and try again */ }
+      }
+    }
+
+    // Verify signature (signed mode = shared HMAC, attest mode = per-party
+    // ed25519). Both paths run BEFORE the x402 quota check; an unauthorized
+    // request never gets the chance to consume payment slots.
     if (room.signed) {
       const prevHdr = req.header("x-prev-id");
       const sigHdr = req.header("x-signature");
@@ -229,14 +300,72 @@ export function createApp(store: Store = makeStore()) {
       if (prevId !== count) {
         return res.status(409).json({ error: "stale_prev_id", currentPrevId: count });
       }
-      const key = await store.getRoomSigningKey(ctx.slug);
-      if (!key) return res.status(500).json({ error: "missing_signing_key" });
-      const expected = crypto.createHmac("sha256", key)
+      // Allow either the master signingKey OR a derived key with caveats.
+      const presented = req.header("x-signing-key-id"); // optional: identifies derived key
+      let effectiveKey: string | null = null;
+      let derivedCaveats: any = null;
+      if (presented && presented.startsWith("d_")) {
+        const cav = await store.getDerivedKey(presented);
+        if (!cav) return res.status(401).json({ error: "unknown_derived_key" });
+        if (cav.expires > 0 && cav.expires < Date.now())
+          return res.status(401).json({ error: "derived_key_expired" });
+        if (cav.fromPrefix && !from.startsWith(cav.fromPrefix))
+          return res.status(403).json({ error: "from_prefix_violation", required: cav.fromPrefix });
+        if (cav.maxUses > 0) {
+          const uses = await store.incrDerivedKeyUses(presented);
+          if (uses > cav.maxUses) return res.status(401).json({ error: "derived_key_max_uses_exceeded" });
+        }
+        effectiveKey = presented; // derived key acts as the HMAC key directly
+        derivedCaveats = cav;
+      } else {
+        effectiveKey = await store.getRoomSigningKey(ctx.slug);
+        if (!effectiveKey) return res.status(500).json({ error: "missing_signing_key" });
+      }
+      const expected = crypto.createHmac("sha256", effectiveKey!)
         .update(`${prevId}|${from}|${body}`)
         .digest("hex");
       const ok = sigHdr.length === expected.length &&
         crypto.timingSafeEqual(Buffer.from(sigHdr, "hex"), Buffer.from(expected, "hex"));
       if (!ok) return res.status(401).json({ error: "bad_signature" });
+      void derivedCaveats; // (caveat record currently used only for enforcement; reserved for future audit envelope)
+    }
+
+    let attestPubkey = "";
+    let attestSig = "";
+    if (room.attest) {
+      const prevHdr = req.header("x-prev-id");
+      const pkHdr = req.header("x-pubkey");
+      const sigHdr = req.header("x-signature");
+      if (!prevHdr || !pkHdr || !sigHdr) {
+        return res.status(401).json({
+          error: "attest_headers_required",
+          hint: "this room was created with ?attest=1; include X-Prev-Id, X-Pubkey (32 bytes hex), X-Signature (64 bytes hex ed25519 sig over `${prev_hash}|${prev_id}|${from}|${body}`)",
+        });
+      }
+      const prevId = Number(prevHdr) | 0;
+      if (prevId !== count) return res.status(409).json({ error: "stale_prev_id", currentPrevId: count });
+      if (!/^[0-9a-f]{64}$/i.test(pkHdr)) return res.status(400).json({ error: "bad_pubkey_hex" });
+      if (!/^[0-9a-f]{128}$/i.test(sigHdr)) return res.status(400).json({ error: "bad_signature_hex" });
+      // TOFU pubkey lock per-from: first pubkey wins.
+      const lockedPk = await store.registerOrCheckPubkey(ctx.slug, from, pkHdr.toLowerCase());
+      if (lockedPk !== pkHdr.toLowerCase())
+        return res.status(401).json({ error: "pubkey_mismatch", lockedPubkey: lockedPk, hint: "this `from` was first seen with a different pubkey; pick a different from or use the original key" });
+      const prevHash = await store.lastHash(ctx.slug);
+      const canonical = `${prevHash}|${prevId}|${from}|${body}`;
+      // Verify ed25519 sig using Node's verify API (raw key import).
+      const pkRaw = Buffer.from(pkHdr, "hex");
+      // Wrap raw 32-byte pubkey in DER for crypto.createPublicKey
+      const der = Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), pkRaw]);
+      let verified = false;
+      try {
+        const keyObj = crypto.createPublicKey({ key: der, format: "der", type: "spki" });
+        verified = crypto.verify(null, Buffer.from(canonical), keyObj, Buffer.from(sigHdr, "hex"));
+      } catch {
+        verified = false;
+      }
+      if (!verified) return res.status(401).json({ error: "bad_signature" });
+      attestPubkey = pkHdr.toLowerCase();
+      attestSig = sigHdr.toLowerCase();
     }
 
     if (count >= cfg.freeMessages) {
@@ -272,16 +401,39 @@ export function createApp(store: Store = makeStore()) {
       })).toString("base64"));
     }
 
-    const msg: Message = await store.appendMessage(ctx.slug, {
-      from, body, ts: Date.now(),
-    });
+    // Hash chain: every message in a signed/attest room carries a hash that
+    // commits to (prev_hash, id, from, body). Clients can replay the chain
+    // to detect server-side reordering or rewriting. v1 trust model still
+    // requires trusting the server, but the chain narrows the cheating
+    // surface to "rewrite consistently or get caught."
+    const id = count + 1;
+    const ts = Date.now();
+    let prev_hash: string | undefined;
+    let hash: string | undefined;
+    if (room.signed || room.attest) {
+      prev_hash = await store.lastHash(ctx.slug);
+      hash = crypto.createHash("sha256")
+        .update(`${prev_hash}|${id}|${from}|${body}`)
+        .digest("hex");
+    }
+    const msgPayload: Omit<Message, "id"> = { from, body, ts };
+    if (reply_to !== undefined) msgPayload.reply_to = reply_to;
+    if (prev_hash !== undefined) msgPayload.prev_hash = prev_hash;
+    if (hash !== undefined) msgPayload.hash = hash;
+    if (attestPubkey) msgPayload.pubkey = attestPubkey;
+    if (attestSig) msgPayload.sig = attestSig;
+    const msg: Message = await store.appendMessage(ctx.slug, msgPayload);
     await store.publish(ctx.slug, msg);
+
     const remaining = Math.max(0, cfg.freeMessages - (count + 1));
     const respBody: Record<string, unknown> = { ok: true, message: msg, freeMessagesRemaining: remaining };
     if (remaining <= 2) {
       respBody.quotaWarning = remaining === 0
         ? "this was the last free message; subsequent posts require x402 payment"
         : `${remaining} free message(s) remaining before x402 payment is required`;
+    }
+    if (idemKey) {
+      await store.setIdempotency(ctx.slug, idemKey, JSON.stringify({ status: 201, body: respBody }), 300);
     }
     res.status(201).json(respBody);
   });

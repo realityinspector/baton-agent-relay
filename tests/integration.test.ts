@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { AddressInfo } from "node:net";
+import crypto from "node:crypto";
 import { createApp } from "../src/server.js";
 
 let base = "";
@@ -68,6 +69,90 @@ describe("public room flow", () => {
     const list = await fetch(`${base}/r/${room.slug}/messages.json`).then(j as any);
     expect(list.messages.length).toBe(1);
     expect(list.messages[0].body).toBe("hi");
+    // envelope self-describes trust model
+    expect(list._meta).toBeDefined();
+    expect(list._meta.auth).toBe("none");
+    expect(list._meta.fromVerified).toBe(false);
+    expect(list._meta.warning).toMatch(/not verified/i);
+  });
+});
+
+describe("signed rooms", () => {
+  it("rejects unsigned posts; accepts valid HMAC; rejects stale prev_id and bad sig", async () => {
+    const c = await fetch(base + "/?signed=1", { method: "POST" });
+    const room = await j(c as any);
+    expect(room.signed).toBe(true);
+    expect(typeof room.signingKey).toBe("string");
+
+    // unsigned post -> 401
+    const r1 = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ from: "a", body: "hi" }),
+    });
+    expect(r1.status).toBe(401);
+
+    // valid signed post
+    const sign = (prevId: number, from: string, body: string) =>
+      crypto.createHmac("sha256", room.signingKey)
+        .update(`${prevId}|${from}|${body}`).digest("hex");
+    const r2 = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-prev-id": "0",
+        "x-signature": sign(0, "alice", "hello"),
+      },
+      body: JSON.stringify({ from: "alice", body: "hello" }),
+    });
+    expect(r2.status).toBe(201);
+
+    // stale prev_id -> 409
+    const r3 = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-prev-id": "0",
+        "x-signature": sign(0, "alice", "hello-2"),
+      },
+      body: JSON.stringify({ from: "alice", body: "hello-2" }),
+    });
+    expect(r3.status).toBe(409);
+    expect((await r3.json()).currentPrevId).toBe(1);
+
+    // bad signature -> 401
+    const r4 = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-prev-id": "1",
+        "x-signature": sign(1, "alice", "different"), // sig over different body
+      },
+      body: JSON.stringify({ from: "alice", body: "hello-2" }),
+    });
+    expect(r4.status).toBe(401);
+
+    // envelope reflects signed
+    const list = await fetch(`${base}/r/${room.slug}/messages.json`).then(j as any);
+    expect(list._meta.auth).toBe("hmac");
+    expect(list._meta.fromVerified).toBe(true);
+  });
+});
+
+describe("quota soft-warn", () => {
+  it("returns freeMessagesRemaining and warns near limit", async () => {
+    const room = await fetch(base + "/", { method: "POST" }).then(j as any);
+    let lastBody: any = null;
+    for (let i = 0; i < 10; i++) {
+      const r = await fetch(`${base}/r/${room.slug}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ from: "x", body: `m${i}` }),
+      });
+      lastBody = await r.json();
+    }
+    expect(lastBody.freeMessagesRemaining).toBe(0);
+    expect(lastBody.quotaWarning).toMatch(/last free message/i);
   });
 });
 

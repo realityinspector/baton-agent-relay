@@ -12,13 +12,22 @@ export type Room = {
   slug: string;
   createdAt: number;
   private: boolean;
-  // secret stored only for private rooms; never returned after creation
+  signed: boolean;
+  // bearer secret (private rooms) and signing key (signed rooms) are stored
+  // separately and never returned after creation.
 };
 
 export interface Store {
-  createRoom(slug: string, isPrivate: boolean, secret?: string): Promise<void>;
+  createRoom(
+    slug: string,
+    isPrivate: boolean,
+    isSigned: boolean,
+    secret?: string,
+    signingKey?: string,
+  ): Promise<void>;
   getRoom(slug: string): Promise<Room | null>;
   getRoomSecret(slug: string): Promise<string | null>;
+  getRoomSigningKey(slug: string): Promise<string | null>;
   appendMessage(slug: string, m: Omit<Message, "id">): Promise<Message>;
   listMessages(slug: string, sinceId?: number): Promise<Message[]>;
   messageCount(slug: string): Promise<number>;
@@ -30,18 +39,21 @@ export interface Store {
 class MemoryStore implements Store {
   rooms = new Map<string, Room>();
   secrets = new Map<string, string>();
+  signingKeys = new Map<string, string>();
   messages = new Map<string, Message[]>();
   paidPayments = new Set<string>();
   subs = new Map<string, Set<(m: Message) => void>>();
 
-  async createRoom(slug: string, isPrivate: boolean, secret?: string) {
+  async createRoom(slug: string, isPrivate: boolean, isSigned: boolean, secret?: string, signingKey?: string) {
     if (this.rooms.has(slug)) throw new Error("collision");
-    this.rooms.set(slug, { slug, createdAt: Date.now(), private: isPrivate });
+    this.rooms.set(slug, { slug, createdAt: Date.now(), private: isPrivate, signed: isSigned });
     if (secret) this.secrets.set(slug, secret);
+    if (signingKey) this.signingKeys.set(slug, signingKey);
     this.messages.set(slug, []);
   }
   async getRoom(slug: string) { return this.rooms.get(slug) ?? null; }
   async getRoomSecret(slug: string) { return this.secrets.get(slug) ?? null; }
+  async getRoomSigningKey(slug: string) { return this.signingKeys.get(slug) ?? null; }
   async appendMessage(slug: string, m: Omit<Message, "id">) {
     const arr = this.messages.get(slug)!;
     const msg: Message = { ...m, id: arr.length + 1 };
@@ -90,23 +102,32 @@ class RedisStore implements Store {
   k = {
     room: (s: string) => `baton:room:${s}`,
     secret: (s: string) => `baton:secret:${s}`,
+    sigkey: (s: string) => `baton:sigkey:${s}`,
     msgs: (s: string) => `baton:msgs:${s}`,
     paid: (s: string, p: string) => `baton:paid:${s}:${p}`,
     chan: (s: string) => `baton:msg:${s}`,
   };
-  async createRoom(slug: string, isPrivate: boolean, secret?: string) {
+  async createRoom(slug: string, isPrivate: boolean, isSigned: boolean, secret?: string, signingKey?: string) {
     const ok = await this.cmd.setnx(this.k.room(slug), JSON.stringify({
-      slug, createdAt: Date.now(), private: isPrivate,
+      slug, createdAt: Date.now(), private: isPrivate, signed: isSigned,
     }));
     if (!ok) throw new Error("collision");
     if (secret) await this.cmd.set(this.k.secret(slug), secret);
+    if (signingKey) await this.cmd.set(this.k.sigkey(slug), signingKey);
   }
   async getRoom(slug: string) {
     const raw = await this.cmd.get(this.k.room(slug));
-    return raw ? JSON.parse(raw) as Room : null;
+    if (!raw) return null;
+    const r = JSON.parse(raw) as Room;
+    // backwards-compat: rooms created before signed flag existed
+    if (typeof (r as any).signed !== "boolean") (r as any).signed = false;
+    return r;
   }
   async getRoomSecret(slug: string) {
     return await this.cmd.get(this.k.secret(slug));
+  }
+  async getRoomSigningKey(slug: string) {
+    return await this.cmd.get(this.k.sigkey(slug));
   }
   async appendMessage(slug: string, m: Omit<Message, "id">) {
     const id = await this.cmd.rpush(this.k.msgs(slug), "placeholder");

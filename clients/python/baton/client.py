@@ -351,6 +351,11 @@ def _request(url: str, *, method: str = "GET", body: Optional[dict] = None,
         # connection-level failure (DNS, reset, refused). map to status=0 so
         # callers can treat it as a transient retry case the same as 5xx.
         raise BatonError(0, {"error": "network", "reason": str(e.reason)})
+    except (TimeoutError, OSError) as e:
+        # Python 3.14 raises raw TimeoutError from socket.read past urllib's
+        # wrapping in some long-poll paths. Map to the same transient bucket
+        # so volley() retries it instead of crashing the loop.
+        raise BatonError(0, {"error": "network", "reason": f"{type(e).__name__}: {e}"})
 
 
 def _ed25519_sign(priv: bytes, msg: bytes) -> bytes:

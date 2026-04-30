@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+baton/__init__.py
+baton/__main__.py
+baton/client.py
+baton_relay.egg-info/PKG-INFO
+baton_relay.egg-info/SOURCES.txt
+baton_relay.egg-info/dependency_links.txt
+baton_relay.egg-info/entry_points.txt
+baton_relay.egg-info/requires.txt
+baton_relay.egg-info/top_level.txt

@@ -87,12 +87,21 @@ def make_handoff() -> str:
     return "\n".join(parts)
 
 
+def _is_end_sentinel(body: str) -> bool:
+    """End the volley only if DONE is unambiguously the message's purpose:
+    last non-blank line is DONE/done (with optional trailing punctuation),
+    or whole body stripped is DONE. Mentioning DONE mid-sentence ('then I'll
+    send DONE') does NOT trigger — that's a description, not the sentinel."""
+    last = next((ln for ln in reversed(body.splitlines()) if ln.strip()), "")
+    cleaned = re.sub(r"[^\w\s]", "", last).strip().lower()
+    return cleaned == "done"
+
 def reply(msg: Message) -> str | None:
     text = msg.body
     upper = text.upper()
     if "HANDOFF" in upper or "REFERENCE DOC" in upper:
         return make_handoff()
-    if "DONE" in upper or "no more questions" in text.lower() or "thanks, that's all" in text.lower():
+    if _is_end_sentinel(text):
         return None
     return find_relevant(text)
 

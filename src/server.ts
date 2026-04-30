@@ -41,20 +41,15 @@ export function createApp(store: Store = makeStore()) {
     process.env.PUBLIC_URL?.replace(/\/$/, "") ||
     `${req.protocol}://${req.get("host")}`;
 
-  const RATE_WINDOW_MS = 10_000;
+  // Rate limit: shared fixed-window via store.incrRateBucket (Redis when
+  // available, in-memory fallback). Window 10s; default cap 30 POSTs per IP
+  // per window. Cap is checked per-POST (not on every request) so reads stay
+  // unmetered. Cross-replica correct.
+  const RATE_WINDOW_SEC = 10;
   const RATE_MAX = Number(process.env.BATON_RATE_MAX || 30);
-  const rate = new Map<string, { n: number; t: number }>();
-  app.use((req, _res, next) => {
-    const ip = req.ip || "anon";
-    const now = Date.now();
-    const e = rate.get(ip);
-    if (!e || now - e.t > RATE_WINDOW_MS) rate.set(ip, { n: 1, t: now });
-    else e.n++;
-    next();
-  });
-  function rateExceeded(ip: string) {
-    const e = rate.get(ip);
-    return !!e && Date.now() - e.t < RATE_WINDOW_MS && e.n > RATE_MAX;
+  async function rateExceeded(ip: string): Promise<boolean> {
+    const n = await store.incrRateBucket(`ip:${ip}`, RATE_WINDOW_SEC);
+    return n > RATE_MAX;
   }
 
   // --- landing & root manual ---
@@ -84,6 +79,19 @@ export function createApp(store: Store = makeStore()) {
       catch { slug = ""; }
     }
     if (!slug) return res.status(500).json({ error: "slug_exhausted" });
+
+    // Pre-registered pubkeys (?parties=alice:hex,bob:hex) close the TOFU
+    // squat race in attest rooms by locking name → pubkey at room creation.
+    if (isAttest && req.query.parties) {
+      const partiesStr = String(req.query.parties);
+      for (const pair of partiesStr.split(",")) {
+        const [name, pk] = pair.split(":");
+        if (!name || !pk || !/^[0-9a-f]{64}$/i.test(pk) || name.includes("|") || name.length > 64) {
+          return res.status(400).json({ error: "bad_parties", hint: "expected ?parties=name1:hex,name2:hex with 32-byte hex pubkeys" });
+        }
+        await store.registerOrCheckPubkey(slug, name.trim(), pk.toLowerCase());
+      }
+    }
 
     const host = hostFor(req);
     const authNote = isAttest
@@ -203,6 +211,10 @@ export function createApp(store: Store = makeStore()) {
   app.get("/r/:slug/messages.json", async (req, res) => {
     const ctx = await loadRoom(req, res); if (!ctx) return;
     const room = (await store.getRoom(ctx.slug))!;
+    // surface currentPrevHash + currentPrevId in the envelope so stateless
+    // signed/attest clients can compute the next signature in one round-trip.
+    const currentPrevId = await store.messageCount(ctx.slug);
+    const currentPrevHash = await store.lastHash(ctx.slug);
     const since = Number(req.query.since || 0) | 0;
     // Long-poll: ?wait=<sec> blocks until a new message lands or the timeout
     // expires. Eliminates token-linear polling for invocation-shaped agents
@@ -218,7 +230,7 @@ export function createApp(store: Store = makeStore()) {
         }).then((u) => { unsub = u; });
       });
     }
-    res.json({ slug: ctx.slug, _meta: envelopeMeta(room), messages });
+    res.json({ slug: ctx.slug, _meta: { ...envelopeMeta(room), currentPrevId, currentPrevHash }, messages });
   });
 
   app.get("/r/:slug/messages", async (req, res) => {
@@ -233,11 +245,19 @@ export function createApp(store: Store = makeStore()) {
     const room = (await store.getRoom(ctx.slug))!;
     // first event self-describes the channel's trust model
     res.write(`event: meta\ndata: ${JSON.stringify(envelopeMeta(room))}\n\n`);
-    const since = Number(req.query.since || 0) | 0;
+    // Honor Last-Event-ID per the SSE spec: if a reconnecting client sent it,
+    // resume from that point. Falls back to ?since=N for clients that don't
+    // forward the header (browsers do automatically; curl does not).
+    const lastEventIdHdr = req.header("last-event-id");
+    const sinceFromHeader = lastEventIdHdr ? (Number(lastEventIdHdr) | 0) : 0;
+    const since = Math.max(sinceFromHeader, Number(req.query.since || 0) | 0);
     const backlog = await store.listMessages(ctx.slug, since);
-    for (const m of backlog) res.write(`event: message\ndata: ${JSON.stringify(m)}\n\n`);
+    // Tag each frame with `id:` so the browser populates Last-Event-ID on
+    // reconnect — closes the gap where a SSE consumer dropped a message
+    // during a network hiccup.
+    for (const m of backlog) res.write(`id: ${m.id}\nevent: message\ndata: ${JSON.stringify(m)}\n\n`);
     const unsub = await store.subscribe(ctx.slug, (m) => {
-      res.write(`event: message\ndata: ${JSON.stringify(m)}\n\n`);
+      res.write(`id: ${m.id}\nevent: message\ndata: ${JSON.stringify(m)}\n\n`);
     });
     const ka = setInterval(() => res.write(`: keepalive\n\n`), 25_000);
     req.on("close", () => { clearInterval(ka); unsub(); });
@@ -246,7 +266,7 @@ export function createApp(store: Store = makeStore()) {
   // --- post message (with x402 quota) ---
   app.post("/r/:slug", async (req, res) => {
     const ctx = await loadRoom(req, res); if (!ctx) return;
-    if (rateExceeded(req.ip || "anon"))
+    if (await rateExceeded(req.ip || "anon"))
       return res.status(429).json({ error: "rate_limited" });
 
     const { from, body, reply_to } = (req.body || {}) as { from?: string; body?: string; reply_to?: number };
@@ -284,26 +304,30 @@ export function createApp(store: Store = makeStore()) {
       }
     }
 
-    // Verify signature (signed mode = shared HMAC, attest mode = per-party
-    // ed25519). Both paths run BEFORE the x402 quota check; an unauthorized
-    // request never gets the chance to consume payment slots.
+    // Both signed and attest modes use the same canonical input:
+    //   `${prev_hash}|${prev_id}|${from}|${body}`
+    // Including prev_hash in the signed input means the client-provided
+    // signature commits to the chain position, not just the position index —
+    // closing the v1 gap where a malicious server could rewrite prev_hash on
+    // a single signed-mode message without invalidating the client sig.
+    const prevHash = (room.signed || room.attest) ? await store.lastHash(ctx.slug) : "";
+
     if (room.signed) {
       const prevHdr = req.header("x-prev-id");
       const sigHdr = req.header("x-signature");
       if (!prevHdr || !sigHdr) {
         return res.status(401).json({
           error: "signature_required",
-          hint: "this room was created with ?signed=1; include X-Prev-Id and X-Signature headers",
+          hint: "?signed=1 room: include X-Prev-Id, X-Signature = hex(HMAC-SHA256(signingKey, `${prev_hash}|${prev_id}|${from}|${body}`)). prev_hash for the first post is the empty string.",
         });
       }
       const prevId = Number(prevHdr) | 0;
       if (prevId !== count) {
-        return res.status(409).json({ error: "stale_prev_id", currentPrevId: count });
+        return res.status(409).json({ error: "stale_prev_id", currentPrevId: count, currentPrevHash: prevHash });
       }
       // Allow either the master signingKey OR a derived key with caveats.
-      const presented = req.header("x-signing-key-id"); // optional: identifies derived key
+      const presented = req.header("x-signing-key-id");
       let effectiveKey: string | null = null;
-      let derivedCaveats: any = null;
       if (presented && presented.startsWith("d_")) {
         const cav = await store.getDerivedKey(presented);
         if (!cav) return res.status(401).json({ error: "unknown_derived_key" });
@@ -315,19 +339,17 @@ export function createApp(store: Store = makeStore()) {
           const uses = await store.incrDerivedKeyUses(presented);
           if (uses > cav.maxUses) return res.status(401).json({ error: "derived_key_max_uses_exceeded" });
         }
-        effectiveKey = presented; // derived key acts as the HMAC key directly
-        derivedCaveats = cav;
+        effectiveKey = presented;
       } else {
         effectiveKey = await store.getRoomSigningKey(ctx.slug);
         if (!effectiveKey) return res.status(500).json({ error: "missing_signing_key" });
       }
       const expected = crypto.createHmac("sha256", effectiveKey!)
-        .update(`${prevId}|${from}|${body}`)
+        .update(`${prevHash}|${prevId}|${from}|${body}`)
         .digest("hex");
       const ok = sigHdr.length === expected.length &&
         crypto.timingSafeEqual(Buffer.from(sigHdr, "hex"), Buffer.from(expected, "hex"));
-      if (!ok) return res.status(401).json({ error: "bad_signature" });
-      void derivedCaveats; // (caveat record currently used only for enforcement; reserved for future audit envelope)
+      if (!ok) return res.status(401).json({ error: "bad_signature", hint: "canonical input: `${prev_hash}|${prev_id}|${from}|${body}` (prev_hash is on the latest message; '' for first post)" });
     }
 
     let attestPubkey = "";
@@ -343,14 +365,15 @@ export function createApp(store: Store = makeStore()) {
         });
       }
       const prevId = Number(prevHdr) | 0;
-      if (prevId !== count) return res.status(409).json({ error: "stale_prev_id", currentPrevId: count });
+      if (prevId !== count) return res.status(409).json({ error: "stale_prev_id", currentPrevId: count, currentPrevHash: prevHash });
       if (!/^[0-9a-f]{64}$/i.test(pkHdr)) return res.status(400).json({ error: "bad_pubkey_hex" });
       if (!/^[0-9a-f]{128}$/i.test(sigHdr)) return res.status(400).json({ error: "bad_signature_hex" });
-      // TOFU pubkey lock per-from: first pubkey wins.
+      // TOFU pubkey lock per-from: first pubkey wins. If parties were
+      // pre-registered at room creation (?parties=alice:hex,bob:hex), the
+      // pre-registration acts as the "first" — closes the squat race.
       const lockedPk = await store.registerOrCheckPubkey(ctx.slug, from, pkHdr.toLowerCase());
       if (lockedPk !== pkHdr.toLowerCase())
-        return res.status(401).json({ error: "pubkey_mismatch", lockedPubkey: lockedPk, hint: "this `from` was first seen with a different pubkey; pick a different from or use the original key" });
-      const prevHash = await store.lastHash(ctx.slug);
+        return res.status(401).json({ error: "pubkey_mismatch", lockedPubkey: lockedPk, hint: "this `from` was first registered (or pre-registered at room creation) with a different pubkey" });
       const canonical = `${prevHash}|${prevId}|${from}|${body}`;
       // Verify ed25519 sig using Node's verify API (raw key import).
       const pkRaw = Buffer.from(pkHdr, "hex");
@@ -411,7 +434,7 @@ export function createApp(store: Store = makeStore()) {
     let prev_hash: string | undefined;
     let hash: string | undefined;
     if (room.signed || room.attest) {
-      prev_hash = await store.lastHash(ctx.slug);
+      prev_hash = prevHash; // already loaded once above; reuse
       hash = crypto.createHash("sha256")
         .update(`${prev_hash}|${id}|${from}|${body}`)
         .digest("hex");

@@ -64,6 +64,9 @@ export interface Store {
   putDerivedKey(derivedKey: string, caveats: KeyCaveats): Promise<void>;
   getDerivedKey(derivedKey: string): Promise<KeyCaveats | null>;
   incrDerivedKeyUses(derivedKey: string): Promise<number>; // returns new count
+  // Rate-limit token bucket. Fixed-window per (bucket, windowSec). Returns
+  // the post-increment count. Caller compares to capacity.
+  incrRateBucket(bucket: string, windowSec: number): Promise<number>;
   publish(slug: string, m: Message): Promise<void>;
   subscribe(slug: string, cb: (m: Message) => void): Promise<() => void>;
 }
@@ -141,6 +144,18 @@ class MemoryStore implements Store {
     const n = (this.derivedKeyUses.get(derivedKey) ?? 0) + 1;
     this.derivedKeyUses.set(derivedKey, n);
     return n;
+  }
+  rateBuckets = new Map<string, { count: number; expires: number }>();
+  async incrRateBucket(bucket: string, windowSec: number) {
+    const now = Date.now();
+    const k = `${bucket}:${Math.floor(now / (windowSec * 1000))}`;
+    const e = this.rateBuckets.get(k);
+    if (!e || e.expires < now) {
+      this.rateBuckets.set(k, { count: 1, expires: now + windowSec * 1000 });
+      return 1;
+    }
+    e.count++;
+    return e.count;
   }
   async publish(slug: string, m: Message) {
     const set = this.subs.get(slug);
@@ -251,6 +266,13 @@ class RedisStore implements Store {
   }
   async incrDerivedKeyUses(derivedKey: string) {
     return await this.cmd.incr(this.k.derivedUses(derivedKey));
+  }
+  async incrRateBucket(bucket: string, windowSec: number) {
+    const window = Math.floor(Date.now() / (windowSec * 1000));
+    const key = `baton:rl:${bucket}:${window}`;
+    const n = await this.cmd.incr(key);
+    if (n === 1) await this.cmd.expire(key, windowSec + 1);
+    return n;
   }
   async publish(slug: string, m: Message) {
     await this.pub.publish(this.k.chan(slug), JSON.stringify(m));

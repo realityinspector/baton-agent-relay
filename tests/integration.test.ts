@@ -94,19 +94,20 @@ describe("signed rooms", () => {
     expect(r1.status).toBe(401);
 
     // valid signed post
-    const sign = (prevId: number, from: string, body: string) =>
+    const sign = (prevHash: string, prevId: number, from: string, body: string) =>
       crypto.createHmac("sha256", room.signingKey)
-        .update(`${prevId}|${from}|${body}`).digest("hex");
+        .update(`${prevHash}|${prevId}|${from}|${body}`).digest("hex");
     const r2 = await fetch(`${base}/r/${room.slug}`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         "x-prev-id": "0",
-        "x-signature": sign(0, "alice", "hello"),
+        "x-signature": sign("", 0, "alice", "hello"),
       },
       body: JSON.stringify({ from: "alice", body: "hello" }),
     });
     expect(r2.status).toBe(201);
+    const m1Hash = (await r2.json()).message.hash;
 
     // stale prev_id -> 409
     const r3 = await fetch(`${base}/r/${room.slug}`, {
@@ -114,7 +115,7 @@ describe("signed rooms", () => {
       headers: {
         "content-type": "application/json",
         "x-prev-id": "0",
-        "x-signature": sign(0, "alice", "hello-2"),
+        "x-signature": sign("", 0, "alice", "hello-2"),
       },
       body: JSON.stringify({ from: "alice", body: "hello-2" }),
     });
@@ -127,7 +128,7 @@ describe("signed rooms", () => {
       headers: {
         "content-type": "application/json",
         "x-prev-id": "1",
-        "x-signature": sign(1, "alice", "different"), // sig over different body
+        "x-signature": sign(m1Hash, 1, "alice", "different"), // sig over different body
       },
       body: JSON.stringify({ from: "alice", body: "hello-2" }),
     });
@@ -165,9 +166,9 @@ describe("signed rooms", () => {
     // the canonical (prev_id|from|body) input correctly.
     const c = await fetch(base + "/?signed=1", { method: "POST" });
     const room = await j(c as any);
-    const sign = (prevId: number, from: string, body: string) =>
+    const sign = (prevHash: string, prevId: number, from: string, body: string) =>
       crypto.createHmac("sha256", room.signingKey)
-        .update(`${prevId}|${from}|${body}`).digest("hex");
+        .update(`${prevHash}|${prevId}|${from}|${body}`).digest("hex");
 
     // body with trailing newline
     const bodyTrailingNL = "hello world\n";
@@ -176,11 +177,12 @@ describe("signed rooms", () => {
       headers: {
         "content-type": "application/json",
         "x-prev-id": "0",
-        "x-signature": sign(0, "alice", bodyTrailingNL),
+        "x-signature": sign("", 0, "alice", bodyTrailingNL),
       },
       body: JSON.stringify({ from: "alice", body: bodyTrailingNL }),
     });
     expect(r1.status).toBe(201);
+    const m1Hash = (await r1.json()).message.hash;
     // body with leading whitespace
     const bodyLeadingWS = "  indented hello";
     const r2 = await fetch(`${base}/r/${room.slug}`, {
@@ -188,7 +190,7 @@ describe("signed rooms", () => {
       headers: {
         "content-type": "application/json",
         "x-prev-id": "1",
-        "x-signature": sign(1, "alice", bodyLeadingWS),
+        "x-signature": sign(m1Hash, 1, "alice", bodyLeadingWS),
       },
       body: JSON.stringify({ from: "alice", body: bodyLeadingWS }),
     });
@@ -265,21 +267,21 @@ describe("hash chain", () => {
   it("each signed-room message links to the prior via prev_hash; chain is verifiable", async () => {
     const c = await fetch(base + "/?signed=1", { method: "POST" });
     const room = await j(c as any);
-    const sign = (prevId: number, from: string, body: string) =>
+    const sign = (prevHash: string, prevId: number, from: string, body: string) =>
       crypto.createHmac("sha256", room.signingKey)
-        .update(`${prevId}|${from}|${body}`).digest("hex");
-    const post = (prevId: number, from: string, body: string) => fetch(`${base}/r/${room.slug}`, {
+        .update(`${prevHash}|${prevId}|${from}|${body}`).digest("hex");
+    const post = (prevHash: string, prevId: number, from: string, body: string) => fetch(`${base}/r/${room.slug}`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         "x-prev-id": String(prevId),
-        "x-signature": sign(prevId, from, body),
+        "x-signature": sign(prevHash, prevId, from, body),
       },
       body: JSON.stringify({ from, body }),
     });
-    const r1 = await post(0, "a", "one");
+    const r1 = await post("", 0, "a", "one");
     const m1 = (await r1.json()).message;
-    const r2 = await post(1, "a", "two");
+    const r2 = await post(m1.hash, 1, "a", "two");
     const m2 = (await r2.json()).message;
     expect(m1.prev_hash).toBe("");
     expect(m1.hash).toMatch(/^[0-9a-f]{64}$/);
@@ -339,6 +341,56 @@ describe("attest mode (ed25519 + TOFU)", () => {
   });
 });
 
+describe("attest pre-registered pubkeys", () => {
+  it("?parties=name:hex pre-locks pubkeys; closes the TOFU squat race", async () => {
+    const { publicKey: pkA } = crypto.generateKeyPairSync("ed25519");
+    const { publicKey: pkSquatter, privateKey: skSquatter } = crypto.generateKeyPairSync("ed25519");
+    const rawPk = (k: crypto.KeyObject) => k.export({ format: "der", type: "spki" }).slice(-32).toString("hex");
+    const pkAHex = rawPk(pkA);
+    const pkSquatHex = rawPk(pkSquatter);
+
+    const c = await fetch(base + `/?attest=1&parties=alice:${pkAHex}`, { method: "POST" });
+    const room = await j(c as any);
+    expect(room.attest).toBe(true);
+
+    // Squatter races to claim "alice" with a different pubkey.
+    const canonical = `||0|alice|hi`; // prev_hash="", prev_id=0
+    const sig = crypto.sign(null, Buffer.from(canonical), skSquatter).toString("hex");
+    const r = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-prev-id": "0",
+        "x-pubkey": pkSquatHex,
+        "x-signature": sig,
+      },
+      body: JSON.stringify({ from: "alice", body: "hi" }),
+    });
+    expect(r.status).toBe(401);
+    expect((await r.json()).error).toBe("pubkey_mismatch");
+  });
+});
+
+describe("messages.json envelope", () => {
+  it("includes currentPrevId and currentPrevHash for stateless signers", async () => {
+    const c = await fetch(base + "/?signed=1", { method: "POST" });
+    const room = await j(c as any);
+    let env = await fetch(`${base}/r/${room.slug}/messages.json`).then(j as any);
+    expect(env._meta.currentPrevId).toBe(0);
+    expect(env._meta.currentPrevHash).toBe("");
+    const sig = crypto.createHmac("sha256", room.signingKey)
+      .update(`|0|alice|hi`).digest("hex");
+    await fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-prev-id": "0", "x-signature": sig },
+      body: JSON.stringify({ from: "alice", body: "hi" }),
+    });
+    env = await fetch(`${base}/r/${room.slug}/messages.json`).then(j as any);
+    expect(env._meta.currentPrevId).toBe(1);
+    expect(env._meta.currentPrevHash).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
 describe("derived keys (macaroon-style)", () => {
   it("issues a derived key with caveats; enforces fromPrefix and maxUses", async () => {
     const c = await fetch(base + "/?signed=1", { method: "POST" });
@@ -352,9 +404,9 @@ describe("derived keys (macaroon-style)", () => {
     const { derivedKey } = await dr.json();
     expect(derivedKey).toMatch(/^d_/);
 
-    const sign = (key: string, prevId: number, from: string, body: string) =>
+    const sign = (key: string, prevHash: string, prevId: number, from: string, body: string) =>
       crypto.createHmac("sha256", key)
-        .update(`${prevId}|${from}|${body}`).digest("hex");
+        .update(`${prevHash}|${prevId}|${from}|${body}`).digest("hex");
 
     // post as worker-1 (allowed by prefix)
     const r1 = await fetch(`${base}/r/${room.slug}`, {
@@ -363,20 +415,21 @@ describe("derived keys (macaroon-style)", () => {
         "content-type": "application/json",
         "x-prev-id": "0",
         "x-signing-key-id": derivedKey,
-        "x-signature": sign(derivedKey, 0, "worker-1", "hi"),
+        "x-signature": sign(derivedKey, "", 0, "worker-1", "hi"),
       },
       body: JSON.stringify({ from: "worker-1", body: "hi" }),
     });
     expect(r1.status).toBe(201);
+    const m1Hash = (await r1.json()).message.hash;
 
-    // post as alice (violates prefix) -> 403
+    // post as alice (violates prefix) -> 403; uses currently-correct prev_id+hash
     const r2 = await fetch(`${base}/r/${room.slug}`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         "x-prev-id": "1",
         "x-signing-key-id": derivedKey,
-        "x-signature": sign(derivedKey, 1, "alice", "hi"),
+        "x-signature": sign(derivedKey, m1Hash, 1, "alice", "hi"),
       },
       body: JSON.stringify({ from: "alice", body: "hi" }),
     });
@@ -390,18 +443,19 @@ describe("derived keys (macaroon-style)", () => {
         "content-type": "application/json",
         "x-prev-id": "1",
         "x-signing-key-id": derivedKey,
-        "x-signature": sign(derivedKey, 1, "worker-2", "hi"),
+        "x-signature": sign(derivedKey, m1Hash, 1, "worker-2", "hi"),
       },
       body: JSON.stringify({ from: "worker-2", body: "hi" }),
     });
     expect(r3.status).toBe(201);
+    const m2Hash = (await r3.json()).message.hash;
     const r4 = await fetch(`${base}/r/${room.slug}`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         "x-prev-id": "2",
         "x-signing-key-id": derivedKey,
-        "x-signature": sign(derivedKey, 2, "worker-3", "hi"),
+        "x-signature": sign(derivedKey, m2Hash, 2, "worker-3", "hi"),
       },
       body: JSON.stringify({ from: "worker-3", body: "hi" }),
     });

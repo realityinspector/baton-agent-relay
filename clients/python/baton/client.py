@@ -195,27 +195,31 @@ class Room:
     def volley(self, my_from: str, generate: Callable[[Message], Optional[str]],
                *, peer_from: Optional[str] = None, max_turns: int = 20,
                idle_seconds: int = 90, on_message: Optional[Callable[[Message], None]] = None) -> list[Message]:
-        """Block on the next message addressed to my role and reply with generate(msg).
+        """Block on the next peer message and reply with generate(msg).
 
         Loop semantics:
-          - long-poll for the next message after my last seen id
+          - long-poll for messages after my last seen id (cap 60s/iter, server limit)
           - skip messages where from_ == my_from (own posts echoed back)
           - if peer_from is set, also skip messages from anyone else
-          - call generate(msg); if it returns a string, post it as my_from
-          - if it returns None, exit (graceful end)
-          - exit after max_turns of *my* posts, or after idle_seconds without
-            receiving a new peer message
+          - call generate(msg); string -> post as my_from with reply_to set;
+            None -> exit (graceful end)
+          - exit after max_turns of *my* posts, or after idle_seconds total
+            with no new peer message
 
         Returns the list of messages posted by this loop.
         """
         sent: list[Message] = []
         turns = 0
+        last_activity = time.time()
         while turns < max_turns:
-            msgs = self.read(wait_seconds=min(60, idle_seconds))
+            remaining_idle = idle_seconds - (time.time() - last_activity)
+            if remaining_idle <= 0:
+                return sent  # idle budget exhausted
+            msgs = self.read(wait_seconds=min(60, max(1, int(remaining_idle))))
             if on_message:
                 for m in msgs:
                     on_message(m)
-            # find first message from peer (or non-self) we haven't replied to
+            # find first peer message we haven't replied to
             target: Optional[Message] = None
             for m in msgs:
                 if m.from_ == my_from:
@@ -224,17 +228,17 @@ class Room:
                     continue
                 target = m
                 break
-            if not target:
-                # nothing to reply to in this batch; either timed out or saw only own echoes
-                if not msgs:
-                    return sent  # idle timeout
-                continue
-            reply = generate(target)
-            if reply is None:
-                return sent
-            posted = self.post(my_from, reply, reply_to=target.id)
-            sent.append(posted)
-            turns += 1
+            if target:
+                last_activity = time.time()
+                reply = generate(target)
+                if reply is None:
+                    return sent
+                posted = self.post(my_from, reply, reply_to=target.id)
+                sent.append(posted)
+                turns += 1
+            elif msgs:
+                # saw only own echoes; reset partial idle so we don't time out mid-conversation
+                last_activity = time.time()
         return sent
 
     # --- low-level ---

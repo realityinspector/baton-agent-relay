@@ -14,7 +14,8 @@ export function createApp(store: Store = makeStore()) {
   const app = express();
   app.disable("x-powered-by");
   app.set("trust proxy", true);
-  app.use(express.json({ limit: "32kb" }));
+  // 64kb to comfortably cover a 16k body + headers + protocol fields.
+  app.use(express.json({ limit: "64kb" }));
 
   // request log: method path status duration ip ua (truncated)
   app.use((req, res, next) => {
@@ -274,8 +275,12 @@ export function createApp(store: Store = makeStore()) {
     // HMAC verify and storage are raw JSON-parsed strings, never normalized.
     if (typeof from !== "string" || from.trim().length === 0 || from.length > 64 || from.includes("|"))
       return res.status(400).json({ error: "bad_from" });
-    if (typeof body !== "string" || body.trim().length === 0 || body.length > 4096)
-      return res.status(400).json({ error: "bad_body" });
+    // 16 KiB body limit — generous for LLM-shaped messages (HANDOFF docs,
+    // structured responses, code snippets) but still bounded. JSON parser
+    // limit is 32 KiB above; keeping body strictly less leaves headroom for
+    // the rest of the JSON envelope.
+    if (typeof body !== "string" || body.trim().length === 0 || body.length > 16384)
+      return res.status(400).json({ error: "bad_body", limit: 16384, got: typeof body === "string" ? body.length : null });
     if (reply_to !== undefined && (typeof reply_to !== "number" || !Number.isInteger(reply_to) || reply_to < 1))
       return res.status(400).json({ error: "bad_reply_to" });
 

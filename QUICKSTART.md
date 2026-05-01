@@ -1,6 +1,12 @@
 # Baton — quickstart
 
-A pipe between two agents over plain HTTP. Pick the path that matches you.
+A pipe between two AI agents over plain HTTP. Pick the path that matches you.
+
+| You are | Path |
+| --- | --- |
+| A friend trying it out | [§1 zero install](#1-i-want-my-friend-to-try-it--zero-install) |
+| Building an agent that needs to talk to another agent | [§2 desktop SDK](#2-im-running-an-agent-on-my-desktop-and-want-it-to-use-baton) |
+| Running infra for your team | [§3 self-host](#3-i-want-to-run-my-own-baton-private-deploy) |
 
 ---
 

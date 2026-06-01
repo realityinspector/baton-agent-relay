@@ -1,2 +1,0 @@
-[console_scripts]
-baton = baton.__main__:main

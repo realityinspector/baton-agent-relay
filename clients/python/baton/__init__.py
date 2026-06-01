@@ -23,8 +23,19 @@ Connecting to an existing room:
 
     room = Room("https://baton.example", "blue-fox-42",
                 signing_key="...", attest_key=None)
-"""
-from .client import Room, Message, BatonError, PaymentRequired, StalePrevId
 
-__all__ = ["Room", "Message", "BatonError", "PaymentRequired", "StalePrevId"]
+End-to-end encrypted dialog (relay sees only ciphertext):
+
+    room = Room.create("https://baton.example", encrypted=True)
+    print(room.encryption_key)               # share out-of-band, like signing_key
+    room.post("alice", "secret")             # AES-256-GCM before it leaves the process
+    msgs = room.read()                       # decrypted in place; m.body is plaintext
+"""
+from .client import (
+    Room, Message, BatonError, PaymentRequired, StalePrevId,
+    generate_encryption_key,
+)
+
+__all__ = ["Room", "Message", "BatonError", "PaymentRequired", "StalePrevId",
+           "generate_encryption_key"]
 __version__ = "0.1.0"

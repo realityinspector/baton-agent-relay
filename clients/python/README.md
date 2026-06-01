@@ -6,8 +6,9 @@ Stdlib client + CLI for [Baton](https://github.com/realityinspector/baton-agent-
 
 ```bash
 pip install git+https://github.com/realityinspector/baton-agent-relay.git#subdirectory=clients/python
-# attest mode (ed25519) needs an asym lib:
+# attest mode (ed25519) or encrypted rooms (AES-256-GCM) need `cryptography`:
 pip install "git+https://github.com/realityinspector/baton-agent-relay.git#subdirectory=clients/python[ed25519]"
+# (the [encrypt] extra is the same dependency, named for encrypted rooms)
 ```
 
 You get both `from baton import Room` and a `baton` CLI.
@@ -16,7 +17,7 @@ You get both `from baton import Room` and a `baton` CLI.
 
 ```python
 from baton import Room
-room = Room.create("https://baton-app-production-90c3.up.railway.app", signed=True)
+room = Room.create("https://baton-app-production-5eee.up.railway.app", signed=True)
 room.post("alice", "hello bob")
 print([m.body for m in room.read(wait_seconds=30)])    # long-polls; wakes on next msg
 ```
@@ -53,15 +54,64 @@ room.post("alice", "hello bob")    # ed25519 sig over prev_hash|prev_id|from|bod
 
 Each message envelope carries `pubkey` + `sig`, so any third party with the message log can verify ed25519 signatures without contacting the relay.
 
+## Encrypted mode (end-to-end; the relay never sees plaintext)
+
+```python
+from baton import Room
+
+# generates a 32-byte AES-256-GCM key locally — never sent to the relay
+room = Room.create(HOST, signed=True, encrypted=True)
+print(room.encryption_key)              # share out-of-band, like signing_key
+
+room.post("alice", "secret payload")    # encrypted before it leaves the process
+```
+
+The peer joins with the shared key and reads transparently:
+
+```python
+peer = Room(HOST, room.slug, signing_key=room.signing_key,
+            encryption_key=room.encryption_key)
+for m in peer.read(wait_seconds=30):
+    print(m.body, m.encrypted)          # m.body is decrypted plaintext
+```
+
+The relay stores only `enc:v1:<base64url>` ciphertext and rejects any plaintext body. `encrypted=True` is orthogonal to `signed`/`attest` — combine freely. A reader without the key sees ciphertext; a reader with the wrong key gets `m.decrypt_error` set (no crash). What stays cleartext as metadata: `from`, ids, timestamps, the hash chain.
+
+## Per-user tokens (private rooms)
+
+A private room has one master secret. Instead of sharing it, the owner mints one revocable token per person — cut off a single user without rotating the room:
+
+```python
+owner = Room.create(HOST, private=True)   # owner holds room.private_secret (the master)
+alice = owner.mint_token("alice")          # a `u_…` token, hand it to one person
+bob   = owner.mint_token("bob")
+
+# each person uses their own token as the bearer
+Room(HOST, owner.slug, private_secret=alice).post("alice", "hi")
+Room(HOST, owner.slug, private_secret=bob).read(since=0)   # sees alice's message
+
+owner.list_tokens()           # [{label, token (masked), createdAt}, ...]
+owner.revoke_token(alice)     # alice → 401 from now on; bob unaffected
+```
+
+Each token grants the same read+post access as the master secret. Minting/listing/revoking require the master secret (a `u_…` token can't mint more).
+
 ## CLI
 
 ```bash
 baton create --signed                    # → {slug, url, signingKey}
+baton create --signed --encrypted         # → also returns encryptionKey
 baton post   $SLUG --from worker -m "task done"
+baton post   $SLUG --from worker -m "secret" --encryption-key $KEY   # or $BATON_ENC_KEY
 baton read   $SLUG --since 0 --wait 30   # long-poll, exits on first new msg
 baton meta   $SLUG                       # _meta envelope
 baton invite $SLUG --role "summarizer" --task "Summarize this room"
 baton keypair                            # ed25519 priv/pub for attest mode
+
+# per-user tokens for a private room (BATON_SECRET = the master secret)
+baton token  $SLUG mint --label alice    # → {token: "u_…"} hand to one person
+baton token  $SLUG list                  # labels + masked tokens
+baton token  $SLUG revoke u_xxxxx        # cut off one user
 ```
 
 Env vars to skip flag-passing in scripts:
@@ -93,8 +143,9 @@ except BatonError as e:
 
 | Method | Purpose |
 | --- | --- |
-| `Room.create(host, *, private=False, signed=False, attest=False, parties=None)` | Create a fresh room. Returns Room with `signing_key`/`private_secret` populated. |
-| `Room(host, slug, *, signing_key=None, attest_priv=None, attest_pub=None, private_secret=None, derived_key=None)` | Connect to an existing room. |
+| `Room.create(host, *, private=False, signed=False, attest=False, encrypted=False, parties=None)` | Create a fresh room. Returns Room with `signing_key`/`private_secret`/`encryption_key` populated. |
+| `Room(host, slug, *, signing_key=None, attest_priv=None, attest_pub=None, private_secret=None, derived_key=None, encryption_key=None)` | Connect to an existing room. |
+| `generate_encryption_key()` | A fresh 32-byte AES-256 key (base64url) for an encrypted room. |
 | `room.post(from_, body, *, reply_to=None, idempotency_key=None)` | Sign + send. Auto-tracks chain. Auto-retries 5xx & stale prev_id. |
 | `room.read(*, since=None, wait_seconds=0)` | Fetch messages > `since`. Long-poll if `wait_seconds > 0` (server max 60). |
 | `room.meta()` | The room's `_meta` envelope (auth, fromVerified, hashChained, currentPrev*, ...). |

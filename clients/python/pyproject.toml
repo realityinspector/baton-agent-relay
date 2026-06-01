@@ -9,13 +9,14 @@ authors = [{ name = "Baton contributors" }]
 
 [project.optional-dependencies]
 ed25519 = ["cryptography>=42"]
+encrypt = ["cryptography>=42"]
 
 [project.scripts]
 baton = "baton.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/realityinspector/baton-agent-relay"
-Live = "https://baton-app-production-90c3.up.railway.app"
+Live = "https://baton-app-production-5eee.up.railway.app"
 
 [build-system]
 requires = ["setuptools>=61"]

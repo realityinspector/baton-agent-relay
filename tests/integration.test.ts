@@ -371,6 +371,61 @@ describe("attest pre-registered pubkeys", () => {
   });
 });
 
+describe("encrypted rooms (?encrypted=1)", () => {
+  it("rejects plaintext bodies; accepts enc:v1: ciphertext; envelope reflects it", async () => {
+    const c = await fetch(base + "/?encrypted=1", { method: "POST" });
+    const room = await j(c as any);
+    expect(room.encrypted).toBe(true);
+    expect(typeof room.encryptionNote).toBe("string");
+    // the relay generates no key — encryption is entirely client-side
+    expect(room.encryptionKey).toBeUndefined();
+
+    // a plaintext body is refused — the relay fails closed
+    const r1 = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ from: "alice", body: "this is plaintext" }),
+    });
+    expect(r1.status).toBe(400);
+    expect((await r1.json()).error).toBe("plaintext_in_encrypted_room");
+
+    // an enc:v1: shaped body is accepted (server validates shape, not contents)
+    const ct = "enc:v1:" + Buffer.from("nonce+ciphertext+tag bytes here").toString("base64url");
+    const r2 = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ from: "alice", body: ct }),
+    });
+    expect(r2.status).toBe(201);
+    expect((await r2.json()).message.body).toBe(ct);
+
+    const list = await fetch(`${base}/r/${room.slug}/messages.json`).then(j as any);
+    expect(list._meta.encrypted).toBe(true);
+    expect(list._meta.confidentiality).toMatch(/end-to-end/i);
+  });
+
+  it("combines with ?signed=1 — HMAC is computed over the ciphertext body", async () => {
+    const c = await fetch(base + "/?signed=1&encrypted=1", { method: "POST" });
+    const room = await j(c as any);
+    expect(room.signed).toBe(true);
+    expect(room.encrypted).toBe(true);
+
+    const ct = "enc:v1:" + Buffer.from("opaque ciphertext").toString("base64url");
+    const sig = crypto.createHmac("sha256", room.signingKey)
+      .update(`|0|alice|${ct}`).digest("hex");
+    const r = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-prev-id": "0", "x-signature": sig },
+      body: JSON.stringify({ from: "alice", body: ct }),
+    });
+    expect(r.status).toBe(201);
+
+    const list = await fetch(`${base}/r/${room.slug}/messages.json`).then(j as any);
+    expect(list._meta.encrypted).toBe(true);
+    expect(list._meta.fromVerified).toBe(true);
+  });
+});
+
 describe("messages.json envelope", () => {
   it("includes currentPrevId and currentPrevHash for stateless signers", async () => {
     const c = await fetch(base + "/?signed=1", { method: "POST" });
@@ -533,6 +588,122 @@ describe("private room flow", () => {
       body: JSON.stringify({ from: "a", body: "hi" }),
     });
     expect(r2.status).toBe(201);
+  });
+});
+
+describe("per-user tokens (private rooms)", () => {
+  async function makePrivateRoom() {
+    const c = await fetch(base + "/?private=1", { method: "POST" });
+    return (await j(c as any)) as any;
+  }
+  const bearer = (t: string) => ({ "authorization": `Bearer ${t}` });
+
+  it("advertises tokensUrl on private room creation", async () => {
+    const room = await makePrivateRoom();
+    expect(room.tokensUrl).toBe(`${base}/r/${room.slug}/tokens`);
+    expect(typeof room.tokensNote).toBe("string");
+  });
+
+  it("master secret mints a per-user token that can read and post", async () => {
+    const room = await makePrivateRoom();
+    const mint = await fetch(`${base}/r/${room.slug}/tokens`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...bearer(room.secret) },
+      body: JSON.stringify({ label: "alice" }),
+    });
+    expect(mint.status).toBe(201);
+    const { token, label } = await j(mint as any);
+    expect(label).toBe("alice");
+    expect(token).toMatch(/^u_/);
+
+    // post with the user token
+    const post = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...bearer(token) },
+      body: JSON.stringify({ from: "alice", body: "hi from alice" }),
+    });
+    expect(post.status).toBe(201);
+
+    // read with the user token
+    const read = await fetch(`${base}/r/${room.slug}/messages.json`, { headers: bearer(token) });
+    expect(read.status).toBe(200);
+    const { messages } = await j(read as any);
+    expect(messages.at(-1).body).toBe("hi from alice");
+  });
+
+  it("minting requires the master secret, not a user token", async () => {
+    const room = await makePrivateRoom();
+    // no auth
+    const noAuth = await fetch(`${base}/r/${room.slug}/tokens`, { method: "POST" });
+    expect(noAuth.status).toBe(401);
+    // a valid user token cannot mint more tokens
+    const mint = await fetch(`${base}/r/${room.slug}/tokens`, {
+      method: "POST", headers: { "content-type": "application/json", ...bearer(room.secret) },
+      body: JSON.stringify({ label: "bob" }),
+    });
+    const { token } = await j(mint as any);
+    const escalate = await fetch(`${base}/r/${room.slug}/tokens`, { method: "POST", headers: bearer(token) });
+    expect(escalate.status).toBe(401);
+  });
+
+  it("a random/unknown token is rejected", async () => {
+    const room = await makePrivateRoom();
+    const read = await fetch(`${base}/r/${room.slug}/messages.json`, { headers: bearer("u_totally-made-up") });
+    expect(read.status).toBe(401);
+  });
+
+  it("revoking one token locks out that user but not others", async () => {
+    const room = await makePrivateRoom();
+    const mintOne = async (label: string) => {
+      const r = await fetch(`${base}/r/${room.slug}/tokens`, {
+        method: "POST", headers: { "content-type": "application/json", ...bearer(room.secret) },
+        body: JSON.stringify({ label }),
+      });
+      return (await j(r as any)).token as string;
+    };
+    const alice = await mintOne("alice");
+    const carol = await mintOne("carol");
+
+    // both can read
+    expect((await fetch(`${base}/r/${room.slug}/messages.json`, { headers: bearer(alice) })).status).toBe(200);
+    expect((await fetch(`${base}/r/${room.slug}/messages.json`, { headers: bearer(carol) })).status).toBe(200);
+
+    // revoke alice (master secret required)
+    const del = await fetch(`${base}/r/${room.slug}/tokens/${alice}`, { method: "DELETE", headers: bearer(room.secret) });
+    expect(del.status).toBe(200);
+
+    // alice is out, carol and master still work
+    expect((await fetch(`${base}/r/${room.slug}/messages.json`, { headers: bearer(alice) })).status).toBe(401);
+    expect((await fetch(`${base}/r/${room.slug}/messages.json`, { headers: bearer(carol) })).status).toBe(200);
+    expect((await fetch(`${base}/r/${room.slug}/messages.json`, { headers: bearer(room.secret) })).status).toBe(200);
+
+    // revoking again is a 404
+    const del2 = await fetch(`${base}/r/${room.slug}/tokens/${alice}`, { method: "DELETE", headers: bearer(room.secret) });
+    expect(del2.status).toBe(404);
+  });
+
+  it("lists tokens (masked) for the owner", async () => {
+    const room = await makePrivateRoom();
+    for (const label of ["alice", "bob"]) {
+      await fetch(`${base}/r/${room.slug}/tokens`, {
+        method: "POST", headers: { "content-type": "application/json", ...bearer(room.secret) },
+        body: JSON.stringify({ label }),
+      });
+    }
+    const list = await fetch(`${base}/r/${room.slug}/tokens`, { headers: bearer(room.secret) });
+    expect(list.status).toBe(200);
+    const body = await j(list as any);
+    expect(body.count).toBe(2);
+    expect(body.tokens.map((t: any) => t.label).sort()).toEqual(["alice", "bob"]);
+    // tokens are masked, not full secrets
+    expect(body.tokens[0].token).toMatch(/…$/);
+  });
+
+  it("rejects per-user tokens on non-private rooms", async () => {
+    const c = await fetch(base + "/", { method: "POST" });
+    const room = await j(c as any);
+    const mint = await fetch(`${base}/r/${room.slug}/tokens`, { method: "POST" });
+    expect(mint.status).toBe(400);
   });
 });
 

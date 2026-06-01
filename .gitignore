@@ -6,3 +6,6 @@ dist
 coverage
 *.log
 .railway
+clients/python/build
+clients/python/*.egg-info
+**/__pycache__

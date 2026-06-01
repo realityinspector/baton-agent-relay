@@ -22,6 +22,10 @@ export type Room = {
   private: boolean;
   signed: boolean;
   attest?: boolean;
+  // encrypted rooms are end-to-end: the body is ciphertext the two agents
+  // produce client-side. The server only stores a `encrypted` flag and
+  // enforces that bodies carry the `enc:v1:` prefix — it never holds the key.
+  encrypted?: boolean;
   // bearer secret (private rooms) and signing key (signed rooms) are stored
   // separately and never returned after creation.
 };
@@ -41,6 +45,7 @@ export interface Store {
     isPrivate: boolean,
     isSigned: boolean,
     isAttest: boolean,
+    isEncrypted: boolean,
     secret?: string,
     signingKey?: string,
   ): Promise<void>;
@@ -60,6 +65,13 @@ export interface Store {
   // Attest-mode TOFU pubkey registry: returns the existing pubkey for `from`
   // if any, else stores `pubkey` and returns it.
   registerOrCheckPubkey(slug: string, from: string, pubkey: string): Promise<string>;
+  // Per-user access tokens for private rooms. Each token grants the same
+  // read+post access as the master secret but is labeled and individually
+  // revocable, so one user can be cut off without rotating the whole room.
+  addUserToken(slug: string, token: string, label: string): Promise<void>;
+  getUserToken(slug: string, token: string): Promise<{ label: string; createdAt: number } | null>;
+  revokeUserToken(slug: string, token: string): Promise<boolean>; // true if it existed
+  listUserTokens(slug: string): Promise<Array<{ token: string; label: string; createdAt: number }>>;
   // Derived-key caveat storage.
   putDerivedKey(derivedKey: string, caveats: KeyCaveats): Promise<void>;
   getDerivedKey(derivedKey: string): Promise<KeyCaveats | null>;
@@ -83,10 +95,11 @@ class MemoryStore implements Store {
   pubkeys = new Map<string, string>(); // key: `${slug}:${from}`
   derivedKeys = new Map<string, KeyCaveats>();
   derivedKeyUses = new Map<string, number>();
+  userTokens = new Map<string, Map<string, { label: string; createdAt: number }>>(); // slug -> token -> meta
 
-  async createRoom(slug: string, isPrivate: boolean, isSigned: boolean, isAttest: boolean, secret?: string, signingKey?: string) {
+  async createRoom(slug: string, isPrivate: boolean, isSigned: boolean, isAttest: boolean, isEncrypted: boolean, secret?: string, signingKey?: string) {
     if (this.rooms.has(slug)) throw new Error("collision");
-    this.rooms.set(slug, { slug, createdAt: Date.now(), private: isPrivate, signed: isSigned, attest: isAttest });
+    this.rooms.set(slug, { slug, createdAt: Date.now(), private: isPrivate, signed: isSigned, attest: isAttest, encrypted: isEncrypted });
     if (secret) this.secrets.set(slug, secret);
     if (signingKey) this.signingKeys.set(slug, signingKey);
     this.messages.set(slug, []);
@@ -132,6 +145,22 @@ class MemoryStore implements Store {
     if (existing) return existing;
     this.pubkeys.set(k, pubkey);
     return pubkey;
+  }
+  async addUserToken(slug: string, token: string, label: string) {
+    let m = this.userTokens.get(slug);
+    if (!m) { m = new Map(); this.userTokens.set(slug, m); }
+    m.set(token, { label, createdAt: Date.now() });
+  }
+  async getUserToken(slug: string, token: string) {
+    return this.userTokens.get(slug)?.get(token) ?? null;
+  }
+  async revokeUserToken(slug: string, token: string) {
+    return this.userTokens.get(slug)?.delete(token) ?? false;
+  }
+  async listUserTokens(slug: string) {
+    const m = this.userTokens.get(slug);
+    if (!m) return [];
+    return [...m.entries()].map(([token, v]) => ({ token, ...v }));
   }
   async putDerivedKey(derivedKey: string, caveats: KeyCaveats) {
     this.derivedKeys.set(derivedKey, caveats);
@@ -198,10 +227,11 @@ class RedisStore implements Store {
     pubkey: (s: string, f: string) => `baton:pubkey:${s}:${f}`,
     derived: (k: string) => `baton:derived:${k}`,
     derivedUses: (k: string) => `baton:derived-uses:${k}`,
+    utokens: (s: string) => `baton:utokens:${s}`, // hash: token -> {label,createdAt}
   };
-  async createRoom(slug: string, isPrivate: boolean, isSigned: boolean, isAttest: boolean, secret?: string, signingKey?: string) {
+  async createRoom(slug: string, isPrivate: boolean, isSigned: boolean, isAttest: boolean, isEncrypted: boolean, secret?: string, signingKey?: string) {
     const ok = await this.cmd.setnx(this.k.room(slug), JSON.stringify({
-      slug, createdAt: Date.now(), private: isPrivate, signed: isSigned, attest: isAttest,
+      slug, createdAt: Date.now(), private: isPrivate, signed: isSigned, attest: isAttest, encrypted: isEncrypted,
     }));
     if (!ok) throw new Error("collision");
     if (secret) await this.cmd.set(this.k.secret(slug), secret);
@@ -214,6 +244,7 @@ class RedisStore implements Store {
     // backwards-compat: rooms created before signed flag existed
     if (typeof (r as any).signed !== "boolean") (r as any).signed = false;
     if (typeof (r as any).attest !== "boolean") (r as any).attest = false;
+    if (typeof (r as any).encrypted !== "boolean") (r as any).encrypted = false;
     return r;
   }
   async getRoomSecret(slug: string) {
@@ -254,6 +285,23 @@ class RedisStore implements Store {
     const ok = await this.cmd.set(k, pubkey, "NX");
     if (ok === "OK") return pubkey;
     return (await this.cmd.get(k)) || pubkey;
+  }
+  async addUserToken(slug: string, token: string, label: string) {
+    await this.cmd.hset(this.k.utokens(slug), token, JSON.stringify({ label, createdAt: Date.now() }));
+  }
+  async getUserToken(slug: string, token: string) {
+    const raw = await this.cmd.hget(this.k.utokens(slug), token);
+    return raw ? (JSON.parse(raw) as { label: string; createdAt: number }) : null;
+  }
+  async revokeUserToken(slug: string, token: string) {
+    return (await this.cmd.hdel(this.k.utokens(slug), token)) > 0;
+  }
+  async listUserTokens(slug: string) {
+    const all = await this.cmd.hgetall(this.k.utokens(slug));
+    return Object.entries(all).map(([token, raw]) => {
+      const v = JSON.parse(raw) as { label: string; createdAt: number };
+      return { token, label: v.label, createdAt: v.createdAt };
+    });
   }
   async putDerivedKey(derivedKey: string, caveats: KeyCaveats) {
     const ttl = caveats.expires > 0 ? Math.max(1, Math.ceil((caveats.expires - Date.now()) / 1000)) : 0;

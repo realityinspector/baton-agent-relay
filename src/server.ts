@@ -68,6 +68,11 @@ export function createApp(store: Store = makeStore()) {
     const isPrivate = req.query.private === "1" || req.query.private === "true";
     const isSigned = req.query.signed === "1" || req.query.signed === "true";
     const isAttest = req.query.attest === "1" || req.query.attest === "true";
+    // End-to-end encryption is orthogonal to the auth mode: an encrypted room
+    // can also be public / signed / attest. The server never sees the
+    // encryption key — it only flags the room and enforces the `enc:v1:`
+    // ciphertext envelope on every post.
+    const isEncrypted = req.query.encrypted === "1" || req.query.encrypted === "true";
     if (isAttest && isSigned)
       return res.status(400).json({ error: "attest_and_signed_are_mutually_exclusive" });
     const secret = isPrivate ? crypto.randomBytes(24).toString("base64url") : undefined;
@@ -76,7 +81,7 @@ export function createApp(store: Store = makeStore()) {
     let slug = "", attempts = 0;
     while (attempts++ < 16) {
       slug = randomSlug();
-      try { await store.createRoom(slug, isPrivate, isSigned, isAttest, secret, signingKey); break; }
+      try { await store.createRoom(slug, isPrivate, isSigned, isAttest, isEncrypted, secret, signingKey); break; }
       catch { slug = ""; }
     }
     if (!slug) return res.status(500).json({ error: "slug_exhausted" });
@@ -100,6 +105,9 @@ export function createApp(store: Store = makeStore()) {
       : isSigned
         ? "signed: posts must include X-Signature = HMAC-SHA256(signingKey, `${prev_id}|${from}|${body}`) and header X-Prev-Id = current message count. unsigned posts are rejected. messages are hash-chained."
         : "from is unauthenticated; anyone with this URL can post under any name. use ?signed=1 (shared HMAC) or ?attest=1 (per-party ed25519) for verified authorship.";
+    const encryptionNote = isEncrypted
+      ? "encrypted: end-to-end. Both agents share a 32-byte key out-of-band (the server never sees it) and post bodies as `enc:v1:<base64url>` ciphertext. The server rejects any non-`enc:v1:` body. `from`, ids, timestamps and the hash chain stay in cleartext as metadata."
+      : undefined;
     const body: Record<string, unknown> = {
       slug,
       url: `${host}/r/${slug}`,
@@ -108,10 +116,18 @@ export function createApp(store: Store = makeStore()) {
       private: isPrivate,
       signed: isSigned,
       attest: isAttest,
+      encrypted: isEncrypted,
       freeMessages: x402Config().freeMessages,
       authNote,
     };
-    if (secret) body.secret = secret;
+    if (encryptionNote) body.encryptionNote = encryptionNote;
+    if (secret) {
+      body.secret = secret;
+      // private rooms support per-user tokens: mint one bearer per human/agent
+      // (POST tokensUrl with {secret,label}) so each is individually revocable.
+      body.tokensUrl = `${host}/r/${slug}/tokens`;
+      body.tokensNote = "mint a per-user token: POST tokensUrl with Authorization: Bearer <secret> and {\"label\":\"alice\"}. Each token reads+posts and is revocable via DELETE tokensUrl/<token> without affecting other users.";
+    }
     if (signingKey) body.signingKey = signingKey;
     res.status(201).json(body);
   });
@@ -162,14 +178,85 @@ export function createApp(store: Store = makeStore()) {
     if (room.private) {
       const auth = req.header("authorization") || "";
       const m = /^Bearer\s+(.+)$/i.exec(auth);
+      const presented = m ? m[1] : "";
       const secret = await store.getRoomSecret(slug);
-      if (!m || !secret || m[1] !== secret) {
+      // Accept either the master room secret OR any live per-user token. Both
+      // grant read+post; per-user tokens are labeled and individually revocable
+      // (see POST/DELETE /r/:slug/tokens) so one user can be cut off alone.
+      let ok = !!presented && !!secret && presented === secret;
+      if (!ok && presented) ok = (await store.getUserToken(slug, presented)) !== null;
+      if (!ok) {
         res.status(401).json({ error: "unauthorized" });
         return null;
       }
     }
     return { slug };
   }
+
+  // Per-user token management (private rooms only). The master secret — the
+  // one returned at room creation — authorizes minting, listing, and revoking.
+  // Each minted token is an opaque `u_…` bearer that a single human/agent uses
+  // to read and post; revoking it locks out that one holder without rotating
+  // the room secret (which would lock out everyone).
+  async function requireMasterSecret(req: Request, res: Response, slug: string): Promise<boolean> {
+    if (!SLUG_RE.test(slug)) { res.status(400).json({ error: "bad_slug" }); return false; }
+    const room = await store.getRoom(slug);
+    if (!room) { res.status(404).json({ error: "not_found" }); return false; }
+    if (!room.private) {
+      res.status(400).json({ error: "not_private_room", hint: "per-user tokens only apply to ?private=1 rooms" });
+      return false;
+    }
+    const auth = req.header("authorization") || "";
+    const m = /^Bearer\s+(.+)$/i.exec(auth);
+    const bodySecret = (req.body || {}).secret;
+    const presented = m ? m[1] : (typeof bodySecret === "string" ? bodySecret : "");
+    const secret = await store.getRoomSecret(slug);
+    if (!secret || !presented || presented !== secret) {
+      res.status(401).json({ error: "must_present_master_secret", hint: "send the room secret as `Authorization: Bearer <secret>` or {\"secret\":\"…\"}; a per-user token cannot mint or revoke tokens" });
+      return false;
+    }
+    return true;
+  }
+
+  // Mint a per-user access token. body/query: { secret, label? }.
+  app.post("/r/:slug/tokens", async (req, res) => {
+    const slug = req.params.slug;
+    if (!(await requireMasterSecret(req, res, slug))) return;
+    const label = String((req.body || {}).label || req.query.label || "").slice(0, 64);
+    const token = "u_" + crypto.randomBytes(24).toString("base64url");
+    await store.addUserToken(slug, token, label);
+    const host = hostFor(req);
+    res.status(201).json({
+      token,
+      label,
+      url: `${host}/r/${slug}`,
+      messagesUrl: `${host}/r/${slug}/messages.json`,
+      usage: `read/post with header: Authorization: Bearer ${token}`,
+    });
+  });
+
+  // List per-user tokens (audit). Tokens are masked; labels and createdAt shown.
+  app.get("/r/:slug/tokens", async (req, res) => {
+    const slug = req.params.slug;
+    if (!(await requireMasterSecret(req, res, slug))) return;
+    const list = await store.listUserTokens(slug);
+    res.json({
+      slug,
+      count: list.length,
+      tokens: list
+        .sort((a, b) => a.createdAt - b.createdAt)
+        .map(t => ({ label: t.label, token: t.token.slice(0, 8) + "…", createdAt: t.createdAt })),
+    });
+  });
+
+  // Revoke a single per-user token. Idempotent-ish: 404 if not found.
+  app.delete("/r/:slug/tokens/:token", async (req, res) => {
+    const slug = req.params.slug;
+    if (!(await requireMasterSecret(req, res, slug))) return;
+    const ok = await store.revokeUserToken(slug, req.params.token);
+    if (!ok) return res.status(404).json({ error: "token_not_found" });
+    res.json({ ok: true, revoked: req.params.token.slice(0, 8) + "…" });
+  });
 
   app.get("/r/:slug", async (req, res) => {
     const slug = req.params.slug;
@@ -201,6 +288,10 @@ export function createApp(store: Store = makeStore()) {
       private: room.private,
       signed: room.signed,
       attest: !!room.attest,
+      encrypted: !!room.encrypted,
+      confidentiality: room.encrypted
+        ? "end-to-end: bodies are `enc:v1:` ciphertext; the relay cannot read them. `from`/ids/timestamps remain cleartext metadata."
+        : "none: bodies are stored and served in cleartext (TLS in transit only).",
       warning: room.attest
         ? "from is verified by ed25519 sig; pubkey TOFU-locked per-from; messages hash-chained"
         : room.signed
@@ -285,6 +376,17 @@ export function createApp(store: Store = makeStore()) {
       return res.status(400).json({ error: "bad_reply_to" });
 
     const room = (await store.getRoom(ctx.slug))!;
+
+    // Encrypted rooms: enforce the ciphertext envelope so the relay can never
+    // be handed plaintext by accident. This is a metadata-level check — the
+    // server validates the `enc:v1:` shape, never the key or the contents.
+    if (room.encrypted && !/^enc:v1:[A-Za-z0-9_-]+={0,2}$/.test(body)) {
+      return res.status(400).json({
+        error: "plaintext_in_encrypted_room",
+        hint: "this room was created with ?encrypted=1; bodies must be client-encrypted as `enc:v1:<base64url>`. the relay never sees plaintext or the key.",
+      });
+    }
+
     const cfg = x402Config();
     const count = await store.messageCount(ctx.slug);
 

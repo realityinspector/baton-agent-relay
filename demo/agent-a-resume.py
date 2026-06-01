@@ -16,7 +16,7 @@ _a = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_a)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "clients", "python"))
 from baton import Room  # noqa: E402
 
-HOST = os.environ.get("BATON_HOST", "https://baton-app-production-90c3.up.railway.app")
+HOST = os.environ.get("BATON_HOST", "https://baton-app-production-5eee.up.railway.app")
 SLUG = os.environ["BATON_SLUG"]
 KEY  = os.environ["BATON_KEY"]
 

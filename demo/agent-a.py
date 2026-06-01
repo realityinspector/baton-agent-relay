@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "clients", "pyt
 from baton import Room, Message  # noqa: E402
 
 DOCS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brand-docs")
-HOST = os.environ.get("BATON_HOST", "https://baton-app-production-90c3.up.railway.app")
+HOST = os.environ.get("BATON_HOST", "https://baton-app-production-5eee.up.railway.app")
 
 # Load only current/ docs into memory at startup.
 CURRENT: dict[str, str] = {}

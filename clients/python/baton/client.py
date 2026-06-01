@@ -5,6 +5,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import time
 import urllib.error
 import urllib.parse
@@ -33,6 +34,9 @@ class StalePrevId(BatonError):
         self.current_prev_hash: str = body.get("currentPrevHash", "")
 
 
+_ENC_PREFIX = "enc:v1:"
+
+
 @dataclass
 class Message:
     id: int
@@ -44,6 +48,9 @@ class Message:
     hash: Optional[str] = None
     pubkey: Optional[str] = None
     sig: Optional[str] = None
+    # client-populated, not wire fields:
+    encrypted: bool = False          # True if `body` was decrypted from enc:v1: ciphertext
+    decrypt_error: Optional[str] = None  # set if decryption failed; `body` stays ciphertext
 
     @classmethod
     def from_json(cls, d: dict) -> "Message":
@@ -65,6 +72,7 @@ class Room:
     attest_pub: Optional[bytes] = None     # raw 32-byte pub matching attest_priv
     private_secret: Optional[str] = None   # ?private=1 bearer
     derived_key: Optional[str] = None      # if posting under a derived key
+    encryption_key: Optional[str] = None   # ?encrypted=1, shared 32-byte AES-256 key (base64url)
     _last_id: int = field(default=0, init=False)
     _last_hash: str = field(default="", init=False)
 
@@ -80,19 +88,32 @@ class Room:
 
     @classmethod
     def create(cls, base_url: str, *, private: bool = False, signed: bool = False,
-               attest: bool = False, parties: Optional[dict[str, bytes]] = None) -> "Room":
-        """Create a fresh room. For attest mode, `parties` is {name: pubkey_bytes} to pre-register."""
+               attest: bool = False, encrypted: bool = False,
+               parties: Optional[dict[str, bytes]] = None) -> "Room":
+        """Create a fresh room. For attest mode, `parties` is {name: pubkey_bytes} to pre-register.
+
+        encrypted=True makes the room end-to-end encrypted: a 32-byte AES-256
+        key is generated *locally* (never sent to the relay) and exposed as
+        `room.encryption_key`. Share it out-of-band with the peer, who passes
+        it to `Room(...)`. `post`/`read` then encrypt/decrypt transparently.
+        Orthogonal to signed/attest — combine freely.
+        """
         qs = []
-        if private: qs.append("private=1")
-        if signed:  qs.append("signed=1")
-        if attest:  qs.append("attest=1")
+        if private:   qs.append("private=1")
+        if signed:    qs.append("signed=1")
+        if attest:    qs.append("attest=1")
+        if encrypted: qs.append("encrypted=1")
         if parties:
             qs.append("parties=" + ",".join(f"{n}:{pk.hex()}" for n, pk in parties.items()))
         path = "/" + ("?" + "&".join(qs) if qs else "")
+        # Generate the encryption key before the request fails-fast if the
+        # `cryptography` dependency is missing — don't create a dangling room.
+        enc_key = generate_encryption_key() if encrypted else None
         resp = _request(base_url.rstrip("/") + path, method="POST")
         room = cls(base_url=base_url.rstrip("/"), slug=resp["slug"])
-        if private: room.private_secret = resp.get("secret")
-        if signed:  room.signing_key = resp.get("signingKey")
+        if private:   room.private_secret = resp.get("secret")
+        if signed:    room.signing_key = resp.get("signingKey")
+        if encrypted: room.encryption_key = enc_key
         return room
 
     # --- reads ---
@@ -114,11 +135,61 @@ class Room:
             meta = resp.get("_meta", {})
             if "currentPrevId" in meta: self._last_id = meta["currentPrevId"]
             if "currentPrevHash" in meta: self._last_hash = meta["currentPrevHash"]
+        # Decrypt in place for encrypted rooms. Best-effort: a body that fails
+        # to decrypt (wrong key, corruption) keeps its ciphertext and records
+        # the error in `decrypt_error` so one bad frame can't crash volley().
+        if self.encryption_key:
+            for m in msgs:
+                if m.body.startswith(_ENC_PREFIX):
+                    try:
+                        m.body = _decrypt_body(self.encryption_key, m.body, m.from_)
+                        m.encrypted = True
+                    except Exception as e:
+                        m.decrypt_error = f"{type(e).__name__}: {e}"
         return msgs
 
     def meta(self) -> dict:
         """The room's _meta envelope — describes the trust model self-descriptively."""
         return self._get("/messages.json?since=99999999")["_meta"]
+
+    # --- per-user tokens (private rooms) ---
+    #
+    # A private room has one master secret (`private_secret`). To let several
+    # people in without sharing it, the owner mints one revocable token per
+    # person. Each token grants the same read+post access; revoking one locks
+    # out that holder alone. These calls require the *master* secret, so this
+    # Room must hold it in `private_secret`.
+
+    def mint_token(self, label: str = "") -> str:
+        """Mint a per-user access token. Returns the `u_…` token string.
+
+        Hand it to one person; they use it as `Room(..., private_secret=token)`
+        to read and post. Requires this Room to hold the master secret.
+        """
+        resp = _request(self.url + "/tokens", method="POST",
+                        headers=self._master_auth(), body={"label": label})
+        return resp["token"]
+
+    def list_tokens(self) -> list[dict]:
+        """List minted tokens (masked) for audit: [{label, token, createdAt}]."""
+        return _request(self.url + "/tokens", method="GET",
+                        headers=self._master_auth()).get("tokens", [])
+
+    def revoke_token(self, token: str) -> bool:
+        """Revoke one per-user token. True if it existed, False if already gone."""
+        try:
+            _request(f"{self.url}/tokens/{token}", method="DELETE",
+                     headers=self._master_auth())
+            return True
+        except BatonError as e:
+            if e.status == 404:
+                return False
+            raise
+
+    def _master_auth(self) -> dict:
+        if not self.private_secret:
+            raise BatonError(0, None, "minting/revoking tokens needs the master room secret in private_secret")
+        return {"authorization": f"Bearer {self.private_secret}"}
 
     # --- write ---
 
@@ -160,9 +231,16 @@ class Room:
             self._last_id = meta.get("currentPrevId", 0)
             self._last_hash = meta.get("currentPrevHash", "")
 
+        # Encrypted rooms: the wire body is ciphertext. Everything downstream
+        # (HMAC/ed25519 signature, hash chain) commits to the ciphertext, since
+        # that is what the relay stores — verify-then-decrypt on the read side.
+        wire_body = body
+        if self.encryption_key:
+            wire_body = _encrypt_body(self.encryption_key, body, from_)
+
         prev_id = self._last_id
         prev_hash = self._last_hash
-        canonical = f"{prev_hash}|{prev_id}|{from_}|{body}"
+        canonical = f"{prev_hash}|{prev_id}|{from_}|{wire_body}"
         headers = {"content-type": "application/json"}
         if idem: headers["x-idempotency-key"] = idem
         if self.private_secret: headers["authorization"] = f"Bearer {self.private_secret}"
@@ -181,13 +259,17 @@ class Room:
             headers["x-pubkey"] = self.attest_pub.hex()
             headers["x-signature"] = sig
 
-        payload: dict[str, Any] = {"from": from_, "body": body}
+        payload: dict[str, Any] = {"from": from_, "body": wire_body}
         if reply_to is not None: payload["reply_to"] = reply_to
 
         resp = _request(self.url, method="POST", body=payload, headers=headers)
         msg = Message.from_json(resp["message"])
         self._last_id = msg.id
         if msg.hash: self._last_hash = msg.hash
+        # hand the caller back the plaintext they passed, not the ciphertext
+        if self.encryption_key:
+            msg.body = body
+            msg.encrypted = True
         return msg
 
     # --- volley: two-agent loop ---
@@ -332,6 +414,11 @@ def _request(url: str, *, method: str = "GET", body: Optional[dict] = None,
              headers: Optional[dict] = None) -> dict:
     data = json.dumps(body).encode() if body is not None else None
     h = dict(headers or {})
+    # A JSON body needs the content-type or the server's body parser skips it
+    # (express.json only parses application/json). Set it whenever we send one
+    # unless the caller already did.
+    if data is not None and not any(k.lower() == "content-type" for k in h):
+        h["content-type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=h, method=method)
     try:
         with urllib.request.urlopen(req, timeout=70) as r:
@@ -356,6 +443,55 @@ def _request(url: str, *, method: str = "GET", body: Optional[dict] = None,
         # wrapping in some long-poll paths. Map to the same transient bucket
         # so volley() retries it instead of crashing the loop.
         raise BatonError(0, {"error": "network", "reason": f"{type(e).__name__}: {e}"})
+
+
+# --- end-to-end encryption (?encrypted=1 rooms) ---------------------------
+#
+# Wire format: "enc:v1:" + base64url(nonce[12] ‖ AES-256-GCM(ciphertext ‖ tag)).
+# The GCM associated-data is the message `from`, binding ciphertext to its
+# claimed author. The key is shared between the two agents out-of-band; the
+# relay never receives it and only ever stores the `enc:v1:` string.
+
+def _b64url_decode(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def generate_encryption_key() -> str:
+    """A fresh 32-byte AES-256 key for an ?encrypted=1 room, base64url (unpadded)."""
+    return base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
+
+
+def _aesgcm(key_b64url: str):
+    """Build an AESGCM cipher from a base64url 32-byte key. Requires `cryptography`."""
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError:
+        raise RuntimeError(
+            "encrypted rooms need the `cryptography` package for AES-256-GCM. "
+            "Install it: pip install 'baton-relay[encrypt]'  (or: pip install cryptography)"
+        )
+    key = _b64url_decode(key_b64url)
+    if len(key) != 32:
+        raise BatonError(0, None, "encryption key must decode to 32 bytes")
+    return AESGCM(key)
+
+
+def _encrypt_body(key_b64url: str, plaintext: str, aad: str) -> str:
+    """Encrypt `plaintext` → an `enc:v1:` wire string. `aad` (the `from`) is authenticated, not hidden."""
+    nonce = os.urandom(12)
+    ct = _aesgcm(key_b64url).encrypt(nonce, plaintext.encode(), aad.encode())
+    return _ENC_PREFIX + base64.urlsafe_b64encode(nonce + ct).rstrip(b"=").decode()
+
+
+def _decrypt_body(key_b64url: str, wire: str, aad: str) -> str:
+    """Inverse of `_encrypt_body`. Raises on a wrong key, tampered body, or `from` mismatch."""
+    if not wire.startswith(_ENC_PREFIX):
+        raise ValueError("not an enc:v1: body")
+    blob = _b64url_decode(wire[len(_ENC_PREFIX):])
+    if len(blob) < 13:
+        raise ValueError("ciphertext too short")
+    nonce, ct = blob[:12], blob[12:]
+    return _aesgcm(key_b64url).decrypt(nonce, ct, aad.encode()).decode()
 
 
 def _ed25519_sign(priv: bytes, msg: bytes) -> bytes:

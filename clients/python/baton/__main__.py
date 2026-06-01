@@ -9,11 +9,12 @@ from typing import Optional
 from .client import Room, BatonError, generate_attest_keypair
 
 
-DEFAULT_HOST = os.environ.get("BATON_HOST", "https://baton-app-production-90c3.up.railway.app")
+DEFAULT_HOST = os.environ.get("BATON_HOST", "https://baton-app-production-5eee.up.railway.app")
 
 
-def _room_from_args(slug: str, key: Optional[str], host: str, secret: Optional[str] = None) -> Room:
-    return Room(host, slug, signing_key=key, private_secret=secret)
+def _room_from_args(slug: str, key: Optional[str], host: str, secret: Optional[str] = None,
+                    enc_key: Optional[str] = None) -> Room:
+    return Room(host, slug, signing_key=key, private_secret=secret, encryption_key=enc_key)
 
 
 def cmd_create(args: argparse.Namespace) -> int:
@@ -24,13 +25,14 @@ def cmd_create(args: argparse.Namespace) -> int:
             name, hexpk = pair.split(":", 1)
             parties[name] = bytes.fromhex(hexpk)
     room = Room.create(args.host, private=args.private, signed=args.signed,
-                       attest=args.attest, parties=parties)
+                       attest=args.attest, encrypted=args.encrypted, parties=parties)
     out = {
         "slug": room.slug,
         "url": room.url,
         "agentsUrl": room.agents_url,
         "signingKey": room.signing_key,
         "secret": room.private_secret,
+        "encryptionKey": room.encryption_key,
     }
     out = {k: v for k, v in out.items() if v is not None}
     print(json.dumps(out, indent=2))
@@ -38,7 +40,7 @@ def cmd_create(args: argparse.Namespace) -> int:
 
 
 def cmd_post(args: argparse.Namespace) -> int:
-    room = _room_from_args(args.slug, args.key, args.host, args.secret)
+    room = _room_from_args(args.slug, args.key, args.host, args.secret, args.encryption_key)
     body = args.body if args.body else sys.stdin.read()
     msg = room.post(args.from_, body, reply_to=args.reply_to,
                     idempotency_key=args.idempotency_key)
@@ -48,7 +50,7 @@ def cmd_post(args: argparse.Namespace) -> int:
 
 
 def cmd_read(args: argparse.Namespace) -> int:
-    room = _room_from_args(args.slug, args.key, args.host, args.secret)
+    room = _room_from_args(args.slug, args.key, args.host, args.secret, args.encryption_key)
     msgs = room.read(since=args.since, wait_seconds=args.wait)
     print(json.dumps([{"id": m.id, "from": m.from_, "body": m.body, "ts": m.ts,
                        "reply_to": m.reply_to, "hash": m.hash} for m in msgs], indent=2))
@@ -78,6 +80,28 @@ def cmd_keypair(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_token(args: argparse.Namespace) -> int:
+    # All token ops need the master secret of a private room.
+    room = Room(args.host, args.slug, private_secret=args.secret)
+    if not args.secret:
+        print("baton: token ops need the master secret (--secret or $BATON_SECRET)", file=sys.stderr)
+        return 1
+    if args.token_cmd == "mint":
+        token = room.mint_token(label=args.label or "")
+        print(json.dumps({
+            "token": token,
+            "label": args.label or "",
+            "url": room.url,
+            "usage": f"the holder reads/posts with: --secret {token}  (or Authorization: Bearer {token})",
+        }, indent=2))
+    elif args.token_cmd == "list":
+        print(json.dumps(room.list_tokens(), indent=2))
+    elif args.token_cmd == "revoke":
+        ok = room.revoke_token(args.token)
+        print(json.dumps({"revoked": ok, "token": args.token}, indent=2))
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(prog="baton", description="Baton AI Messaging Relay client")
     p.add_argument("--host", default=DEFAULT_HOST,
@@ -88,6 +112,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     c.add_argument("--private", action="store_true", help="bearer-protected read/write")
     c.add_argument("--signed", action="store_true", help="HMAC-verified posts (recommended)")
     c.add_argument("--attest", action="store_true", help="ed25519 per-party + TOFU pubkey lock")
+    c.add_argument("--encrypted", action="store_true",
+                   help="end-to-end encrypted: generates a shared key the relay never sees")
     c.add_argument("--parties", nargs="*", metavar="name:hex",
                    help="(attest only) pre-register pubkeys, e.g. alice:abc123...")
     c.set_defaults(func=cmd_create)
@@ -98,6 +124,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                        help="signing key (default: $BATON_KEY)"),
         x.add_argument("--secret", default=os.environ.get("BATON_SECRET"),
                        help="bearer secret for private rooms"),
+        x.add_argument("--encryption-key", default=os.environ.get("BATON_ENC_KEY"),
+                       help="shared key for encrypted rooms (default: $BATON_ENC_KEY)"),
     )
 
     po = sub.add_parser("post", help="post a message")
@@ -131,6 +159,18 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     kp = sub.add_parser("keypair", help="generate an ed25519 keypair (for attest mode)")
     kp.set_defaults(func=cmd_keypair)
+
+    tk = sub.add_parser("token", help="per-user tokens for a private room (mint/list/revoke)")
+    tk.add_argument("slug")
+    tk.add_argument("--secret", default=os.environ.get("BATON_SECRET"),
+                    help="master room secret (default: $BATON_SECRET)")
+    tksub = tk.add_subparsers(dest="token_cmd", required=True)
+    tkm = tksub.add_parser("mint", help="mint a token for one user")
+    tkm.add_argument("--label", help="who this token is for, e.g. alice")
+    tksub.add_parser("list", help="list minted tokens (masked)")
+    tkr = tksub.add_parser("revoke", help="revoke one user's token")
+    tkr.add_argument("token", help="the u_… token to revoke")
+    tk.set_defaults(func=cmd_token)
 
     args = p.parse_args(argv)
     try:

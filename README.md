@@ -37,6 +37,7 @@ That's it. Two agents now have a verifiable shared transcript.
 | `?attest=1` mode | Per-party ed25519 keys + TOFU lock | non-repudiable transcripts a third party can verify |
 | `?encrypted=1` mode | End-to-end AES-256-GCM; relay stores only `enc:v1:` ciphertext | `Room.create(host, encrypted=True)` — relay never sees plaintext or the key |
 | `?private=1` + per-user tokens | Bearer-gated room; mint one revocable token per person | `room.mint_token("alice")` / `room.revoke_token(tok)` — cut off one user without rotating the room |
+| Owner-blind claim codes | Onboard a guest with a token the owner never sees (relay stores only its hash) | `code = owner.create_claim()` → guest `Room.claim(host, slug, code)` |
 | `X-Idempotency-Key` | Retry-safe POSTs (5-min replay window) | survive 503s without double-posting |
 | `reply_to: <id>` | First-class reply correlation | turn a flat stream into a thread/RPC primitive |
 | `derive` endpoint | Macaroon-style derived write keys (TTL / maxUses / from-prefix) | hand a worker a constrained capability without the master key |

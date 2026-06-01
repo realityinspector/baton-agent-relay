@@ -68,10 +68,18 @@ export interface Store {
   // Per-user access tokens for private rooms. Each token grants the same
   // read+post access as the master secret but is labeled and individually
   // revocable, so one user can be cut off without rotating the whole room.
-  addUserToken(slug: string, token: string, label: string): Promise<void>;
-  getUserToken(slug: string, token: string): Promise<{ label: string; createdAt: number } | null>;
-  revokeUserToken(slug: string, token: string): Promise<boolean>; // true if it existed
-  listUserTokens(slug: string): Promise<Array<{ token: string; label: string; createdAt: number }>>;
+  // `key` is the auth lookup key: the token value for owner-minted tokens, or
+  // sha256(token) for self-claimed tokens (where the server never sees the raw
+  // token). `handle` is a non-secret id the owner uses to revoke a token they
+  // can't see.
+  addUserToken(slug: string, key: string, label: string, handle: string): Promise<void>;
+  getUserToken(slug: string, key: string): Promise<{ label: string; createdAt: number; handle: string } | null>;
+  revokeUserToken(slug: string, keyOrHandle: string): Promise<boolean>; // matches auth key OR handle
+  listUserTokens(slug: string): Promise<Array<{ key: string; label: string; createdAt: number; handle: string }>>;
+  // Single-use claim codes for owner-blind onboarding. The owner mints a code
+  // (out of band) and the guest redeems it once to register their own token.
+  addClaimCode(slug: string, code: string, label: string, ttlSec: number): Promise<void>;
+  consumeClaimCode(slug: string, code: string): Promise<{ label: string } | null>; // returns + invalidates
   // Derived-key caveat storage.
   putDerivedKey(derivedKey: string, caveats: KeyCaveats): Promise<void>;
   getDerivedKey(derivedKey: string): Promise<KeyCaveats | null>;
@@ -95,7 +103,8 @@ class MemoryStore implements Store {
   pubkeys = new Map<string, string>(); // key: `${slug}:${from}`
   derivedKeys = new Map<string, KeyCaveats>();
   derivedKeyUses = new Map<string, number>();
-  userTokens = new Map<string, Map<string, { label: string; createdAt: number }>>(); // slug -> token -> meta
+  userTokens = new Map<string, Map<string, { label: string; createdAt: number; handle: string }>>(); // slug -> authKey -> meta
+  claimCodes = new Map<string, { label: string; expires: number }>(); // `${slug}:${code}` -> meta
 
   async createRoom(slug: string, isPrivate: boolean, isSigned: boolean, isAttest: boolean, isEncrypted: boolean, secret?: string, signingKey?: string) {
     if (this.rooms.has(slug)) throw new Error("collision");
@@ -146,21 +155,36 @@ class MemoryStore implements Store {
     this.pubkeys.set(k, pubkey);
     return pubkey;
   }
-  async addUserToken(slug: string, token: string, label: string) {
+  async addUserToken(slug: string, key: string, label: string, handle: string) {
     let m = this.userTokens.get(slug);
     if (!m) { m = new Map(); this.userTokens.set(slug, m); }
-    m.set(token, { label, createdAt: Date.now() });
+    m.set(key, { label, createdAt: Date.now(), handle });
   }
-  async getUserToken(slug: string, token: string) {
-    return this.userTokens.get(slug)?.get(token) ?? null;
+  async getUserToken(slug: string, key: string) {
+    return this.userTokens.get(slug)?.get(key) ?? null;
   }
-  async revokeUserToken(slug: string, token: string) {
-    return this.userTokens.get(slug)?.delete(token) ?? false;
+  async revokeUserToken(slug: string, keyOrHandle: string) {
+    const m = this.userTokens.get(slug);
+    if (!m) return false;
+    if (m.delete(keyOrHandle)) return true; // matched the auth key directly
+    for (const [k, v] of m) if (v.handle === keyOrHandle) return m.delete(k);
+    return false;
   }
   async listUserTokens(slug: string) {
     const m = this.userTokens.get(slug);
     if (!m) return [];
-    return [...m.entries()].map(([token, v]) => ({ token, ...v }));
+    return [...m.entries()].map(([key, v]) => ({ key, ...v }));
+  }
+  async addClaimCode(slug: string, code: string, label: string, ttlSec: number) {
+    this.claimCodes.set(`${slug}:${code}`, { label, expires: Date.now() + ttlSec * 1000 });
+  }
+  async consumeClaimCode(slug: string, code: string) {
+    const k = `${slug}:${code}`;
+    const e = this.claimCodes.get(k);
+    if (!e) return null;
+    this.claimCodes.delete(k); // single-use: invalidate regardless of expiry
+    if (e.expires < Date.now()) return null;
+    return { label: e.label };
   }
   async putDerivedKey(derivedKey: string, caveats: KeyCaveats) {
     this.derivedKeys.set(derivedKey, caveats);
@@ -227,7 +251,8 @@ class RedisStore implements Store {
     pubkey: (s: string, f: string) => `baton:pubkey:${s}:${f}`,
     derived: (k: string) => `baton:derived:${k}`,
     derivedUses: (k: string) => `baton:derived-uses:${k}`,
-    utokens: (s: string) => `baton:utokens:${s}`, // hash: token -> {label,createdAt}
+    utokens: (s: string) => `baton:utokens:${s}`, // hash: authKey -> {label,createdAt,handle}
+    claim: (s: string, c: string) => `baton:claim:${s}:${c}`,
   };
   async createRoom(slug: string, isPrivate: boolean, isSigned: boolean, isAttest: boolean, isEncrypted: boolean, secret?: string, signingKey?: string) {
     const ok = await this.cmd.setnx(this.k.room(slug), JSON.stringify({
@@ -286,22 +311,37 @@ class RedisStore implements Store {
     if (ok === "OK") return pubkey;
     return (await this.cmd.get(k)) || pubkey;
   }
-  async addUserToken(slug: string, token: string, label: string) {
-    await this.cmd.hset(this.k.utokens(slug), token, JSON.stringify({ label, createdAt: Date.now() }));
+  async addUserToken(slug: string, key: string, label: string, handle: string) {
+    await this.cmd.hset(this.k.utokens(slug), key, JSON.stringify({ label, createdAt: Date.now(), handle }));
   }
-  async getUserToken(slug: string, token: string) {
-    const raw = await this.cmd.hget(this.k.utokens(slug), token);
-    return raw ? (JSON.parse(raw) as { label: string; createdAt: number }) : null;
+  async getUserToken(slug: string, key: string) {
+    const raw = await this.cmd.hget(this.k.utokens(slug), key);
+    return raw ? (JSON.parse(raw) as { label: string; createdAt: number; handle: string }) : null;
   }
-  async revokeUserToken(slug: string, token: string) {
-    return (await this.cmd.hdel(this.k.utokens(slug), token)) > 0;
+  async revokeUserToken(slug: string, keyOrHandle: string) {
+    if ((await this.cmd.hdel(this.k.utokens(slug), keyOrHandle)) > 0) return true; // direct auth-key match
+    const all = await this.cmd.hgetall(this.k.utokens(slug));
+    for (const [k, raw] of Object.entries(all)) {
+      if ((JSON.parse(raw) as { handle: string }).handle === keyOrHandle) {
+        return (await this.cmd.hdel(this.k.utokens(slug), k)) > 0;
+      }
+    }
+    return false;
   }
   async listUserTokens(slug: string) {
     const all = await this.cmd.hgetall(this.k.utokens(slug));
-    return Object.entries(all).map(([token, raw]) => {
-      const v = JSON.parse(raw) as { label: string; createdAt: number };
-      return { token, label: v.label, createdAt: v.createdAt };
+    return Object.entries(all).map(([key, raw]) => {
+      const v = JSON.parse(raw) as { label: string; createdAt: number; handle: string };
+      return { key, label: v.label, createdAt: v.createdAt, handle: v.handle };
     });
+  }
+  async addClaimCode(slug: string, code: string, label: string, ttlSec: number) {
+    await this.cmd.set(this.k.claim(slug, code), JSON.stringify({ label }), "EX", Math.max(1, ttlSec));
+  }
+  async consumeClaimCode(slug: string, code: string) {
+    // GETDEL is atomic single-use: the first redeemer wins, the code is gone.
+    const raw = await this.cmd.getdel(this.k.claim(slug, code));
+    return raw ? (JSON.parse(raw) as { label: string }) : null;
   }
   async putDerivedKey(derivedKey: string, caveats: KeyCaveats) {
     const ttl = caveats.expires > 0 ? Math.max(1, Math.ceil((caveats.expires - Date.now()) / 1000)) : 0;

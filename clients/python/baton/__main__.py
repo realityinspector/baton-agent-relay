@@ -70,7 +70,8 @@ def cmd_invite(args: argparse.Namespace) -> int:
                            peer_what_it_is=args.peer_what_it_is,
                            from_human=args.from_human,
                            max_messages=args.max_messages,
-                           your_from=args.your_from))
+                           your_from=args.your_from,
+                           access_token=args.token))
     return 0
 
 
@@ -99,6 +100,31 @@ def cmd_token(args: argparse.Namespace) -> int:
     elif args.token_cmd == "revoke":
         ok = room.revoke_token(args.token)
         print(json.dumps({"revoked": ok, "token": args.token}, indent=2))
+    return 0
+
+
+def cmd_claim_link(args: argparse.Namespace) -> int:
+    # Owner mints a single-use claim code (needs the master secret).
+    if not args.secret:
+        print("baton: claim-link needs the master secret (--secret or $BATON_SECRET)", file=sys.stderr)
+        return 1
+    room = Room(args.host, args.slug, private_secret=args.secret)
+    info = room.create_claim(label=args.label or "", ttl_sec=args.ttl)
+    print(json.dumps(info, indent=2))
+    return 0
+
+
+def cmd_claim(args: argparse.Namespace) -> int:
+    # Guest redeems a claim code; the token is generated locally and never seen
+    # by the owner. Print it so the guest can save it.
+    room = Room.claim(args.host, args.slug, args.code)
+    print(json.dumps({
+        "slug": room.slug,
+        "url": room.url,
+        "token": room.private_secret,
+        "usage": f"read/post with --secret {room.private_secret} (or Authorization: Bearer {room.private_secret})",
+        "warning": "save this token — it cannot be recovered",
+    }, indent=2))
     return 0
 
 
@@ -155,6 +181,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     iv.add_argument("--from-human", default="I'm running a small Baton demo")
     iv.add_argument("--max-messages", type=int, default=None)
     iv.add_argument("--your-from", default="agent-b", help='"from" the receiver should sign as')
+    iv.add_argument("--token", help="per-user token for a private room (produces a bearer-auth invite)")
     iv.set_defaults(func=cmd_invite)
 
     kp = sub.add_parser("keypair", help="generate an ed25519 keypair (for attest mode)")
@@ -168,9 +195,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     tkm = tksub.add_parser("mint", help="mint a token for one user")
     tkm.add_argument("--label", help="who this token is for, e.g. alice")
     tksub.add_parser("list", help="list minted tokens (masked)")
-    tkr = tksub.add_parser("revoke", help="revoke one user's token")
-    tkr.add_argument("token", help="the u_… token to revoke")
+    tkr = tksub.add_parser("revoke", help="revoke one user's token (by token or handle)")
+    tkr.add_argument("token", help="the u_… token or h_… handle to revoke")
     tk.set_defaults(func=cmd_token)
+
+    cl = sub.add_parser("claim-link", help="(owner) mint a single-use claim code for owner-blind onboarding")
+    cl.add_argument("slug")
+    cl.add_argument("--secret", default=os.environ.get("BATON_SECRET"),
+                    help="master room secret (default: $BATON_SECRET)")
+    cl.add_argument("--label", help="who this is for, e.g. alice")
+    cl.add_argument("--ttl", type=int, default=86400, help="seconds the code stays valid (default 86400)")
+    cl.set_defaults(func=cmd_claim_link)
+
+    cm = sub.add_parser("claim", help="(guest) redeem a claim code; your token is generated locally, owner never sees it")
+    cm.add_argument("slug")
+    cm.add_argument("--code", required=True, help="the c_… claim code the owner sent you")
+    cm.set_defaults(func=cmd_claim)
 
     args = p.parse_args(argv)
     try:

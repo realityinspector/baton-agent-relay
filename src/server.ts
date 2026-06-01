@@ -42,6 +42,8 @@ export function createApp(store: Store = makeStore()) {
     process.env.PUBLIC_URL?.replace(/\/$/, "") ||
     `${req.protocol}://${req.get("host")}`;
 
+  const sha256hex = (s: string) => crypto.createHash("sha256").update(s).digest("hex");
+
   // Rate limit: shared fixed-window via store.incrRateBucket (Redis when
   // available, in-memory fallback). Window 10s; default cap 30 POSTs per IP
   // per window. Cap is checked per-POST (not on every request) so reads stay
@@ -126,7 +128,11 @@ export function createApp(store: Store = makeStore()) {
       // private rooms support per-user tokens: mint one bearer per human/agent
       // (POST tokensUrl with {secret,label}) so each is individually revocable.
       body.tokensUrl = `${host}/r/${slug}/tokens`;
-      body.tokensNote = "mint a per-user token: POST tokensUrl with Authorization: Bearer <secret> and {\"label\":\"alice\"}. Each token reads+posts and is revocable via DELETE tokensUrl/<token> without affecting other users.";
+      body.tokensNote = "mint a per-user token: POST tokensUrl with Authorization: Bearer <secret> and {\"label\":\"alice\"}. Each token reads+posts and is revocable via DELETE tokensUrl/<token-or-handle> without affecting other users.";
+      // owner-blind onboarding: mint a single-use claim code so a guest can
+      // register a token the owner never sees.
+      body.claimsUrl = `${host}/r/${slug}/claims`;
+      body.claimsNote = "owner-blind onboarding: POST claimsUrl with Authorization: Bearer <secret> to mint a single-use claim code; send the guest the code. They redeem it once (registering only the sha256 of a token they generate locally), so you never see their token.";
     }
     if (signingKey) body.signingKey = signingKey;
     res.status(201).json(body);
@@ -184,7 +190,13 @@ export function createApp(store: Store = makeStore()) {
       // grant read+post; per-user tokens are labeled and individually revocable
       // (see POST/DELETE /r/:slug/tokens) so one user can be cut off alone.
       let ok = !!presented && !!secret && presented === secret;
-      if (!ok && presented) ok = (await store.getUserToken(slug, presented)) !== null;
+      if (!ok && presented) {
+        // owner-minted tokens are stored by value; self-claimed tokens are
+        // stored as sha256(token) (the server never held the raw token), so
+        // try both lookups.
+        ok = (await store.getUserToken(slug, presented)) !== null
+          || (await store.getUserToken(slug, sha256hex(presented))) !== null;
+      }
       if (!ok) {
         res.status(401).json({ error: "unauthorized" });
         return null;
@@ -224,10 +236,12 @@ export function createApp(store: Store = makeStore()) {
     if (!(await requireMasterSecret(req, res, slug))) return;
     const label = String((req.body || {}).label || req.query.label || "").slice(0, 64);
     const token = "u_" + crypto.randomBytes(24).toString("base64url");
-    await store.addUserToken(slug, token, label);
+    const handle = "h_" + crypto.randomBytes(6).toString("hex");
+    await store.addUserToken(slug, token, label, handle);
     const host = hostFor(req);
     res.status(201).json({
       token,
+      handle,
       label,
       url: `${host}/r/${slug}`,
       messagesUrl: `${host}/r/${slug}/messages.json`,
@@ -235,7 +249,9 @@ export function createApp(store: Store = makeStore()) {
     });
   });
 
-  // List per-user tokens (audit). Tokens are masked; labels and createdAt shown.
+  // List per-user tokens (audit). Auth keys are masked; the non-secret handle
+  // is shown so the owner can revoke any token — including claimed ones they
+  // have never seen — via DELETE /r/:slug/tokens/<handle>.
   app.get("/r/:slug/tokens", async (req, res) => {
     const slug = req.params.slug;
     if (!(await requireMasterSecret(req, res, slug))) return;
@@ -245,17 +261,68 @@ export function createApp(store: Store = makeStore()) {
       count: list.length,
       tokens: list
         .sort((a, b) => a.createdAt - b.createdAt)
-        .map(t => ({ label: t.label, token: t.token.slice(0, 8) + "…", createdAt: t.createdAt })),
+        .map(t => ({ label: t.label, handle: t.handle, token: t.key.slice(0, 8) + "…", createdAt: t.createdAt })),
     });
   });
 
-  // Revoke a single per-user token. Idempotent-ish: 404 if not found.
+  // Revoke a single per-user token by its auth key (owner-minted token value)
+  // OR its handle (works for claimed tokens the owner can't see). 404 if none.
   app.delete("/r/:slug/tokens/:token", async (req, res) => {
     const slug = req.params.slug;
     if (!(await requireMasterSecret(req, res, slug))) return;
     const ok = await store.revokeUserToken(slug, req.params.token);
     if (!ok) return res.status(404).json({ error: "token_not_found" });
     res.json({ ok: true, revoked: req.params.token.slice(0, 8) + "…" });
+  });
+
+  // --- owner-blind onboarding via single-use claim codes ---
+  // The owner mints a claim code (master secret) and sends the guest a claim
+  // link. The guest's client generates a token locally and registers only its
+  // sha256 hash, so the owner never sees the token and the relay never stores
+  // it in the clear. Each claimed token still gets a handle for revocation.
+
+  // Mint a claim code. body: { secret, label?, ttlSec? }.
+  app.post("/r/:slug/claims", async (req, res) => {
+    const slug = req.params.slug;
+    if (!(await requireMasterSecret(req, res, slug))) return;
+    const label = String((req.body || {}).label || "").slice(0, 64);
+    const ttlSec = Math.min(7 * 86400, Math.max(60, Number((req.body || {}).ttlSec || 86400) | 0));
+    const code = "c_" + crypto.randomBytes(24).toString("base64url");
+    await store.addClaimCode(slug, code, label, ttlSec);
+    const host = hostFor(req);
+    res.status(201).json({
+      claimCode: code,
+      claimUrl: `${host}/r/${slug}/claim`,
+      label,
+      expiresInSec: ttlSec,
+      guestInstructions: `redeem once: POST ${host}/r/${slug}/claim with {"claimCode":"${code}","tokenHash":"<sha256hex of a token you generate locally>"}. Then read/post with Authorization: Bearer <your token>. The owner never sees your token.`,
+    });
+  });
+
+  // Redeem a claim code. body: { claimCode, tokenHash }. No master secret: the
+  // single-use code IS the capability. Not routed through loadRoom (the guest
+  // has no token yet). tokenHash = sha256(token) the guest keeps to itself.
+  app.post("/r/:slug/claim", async (req, res) => {
+    const slug = req.params.slug;
+    if (!SLUG_RE.test(slug)) return res.status(400).json({ error: "bad_slug" });
+    const room = await store.getRoom(slug);
+    if (!room || !room.private) return res.status(404).json({ error: "not_private_room" });
+    const claimCode = String((req.body || {}).claimCode || "");
+    const tokenHash = String((req.body || {}).tokenHash || "").toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(tokenHash))
+      return res.status(400).json({ error: "bad_token_hash", hint: "tokenHash must be sha256(token) as 64 hex chars; generate the token client-side and never send it" });
+    const claim = await store.consumeClaimCode(slug, claimCode);
+    if (!claim) return res.status(404).json({ error: "claim_code_invalid_or_used" });
+    const handle = "h_" + crypto.randomBytes(6).toString("hex");
+    // store BY HASH: the server matches a presented token by sha256 at auth time
+    await store.addUserToken(slug, tokenHash, claim.label, handle);
+    res.status(201).json({
+      ok: true,
+      label: claim.label,
+      handle,
+      url: `${hostFor(req)}/r/${slug}`,
+      note: "registered. read/post with Authorization: Bearer <your token>. Keep the token; it cannot be recovered.",
+    });
   });
 
   app.get("/r/:slug", async (req, res) => {

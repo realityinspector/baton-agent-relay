@@ -707,6 +707,114 @@ describe("per-user tokens (private rooms)", () => {
   });
 });
 
+describe("owner-blind claim onboarding (private rooms)", () => {
+  const bearer = (t: string) => ({ "authorization": `Bearer ${t}` });
+  const sha256hex = (s: string) => crypto.createHash("sha256").update(s).digest("hex");
+
+  async function makePrivateRoom() {
+    return (await j(await fetch(base + "/?private=1", { method: "POST" }) as any)) as any;
+  }
+  async function mintClaim(room: any, label = "guest") {
+    const r = await fetch(`${base}/r/${room.slug}/claims`, {
+      method: "POST", headers: { "content-type": "application/json", ...bearer(room.secret) },
+      body: JSON.stringify({ label }),
+    });
+    return { status: r.status, body: await j(r as any) };
+  }
+
+  it("advertises claimsUrl on private room creation", async () => {
+    const room = await makePrivateRoom();
+    expect(room.claimsUrl).toBe(`${base}/r/${room.slug}/claims`);
+  });
+
+  it("guest claims a token the owner never sees; it grants access", async () => {
+    const room = await makePrivateRoom();
+    const { status, body } = await mintClaim(room, "alice");
+    expect(status).toBe(201);
+    expect(body.claimCode).toMatch(/^c_/);
+
+    // guest generates a token locally; only its hash is sent to the relay
+    const token = "u_" + crypto.randomBytes(24).toString("base64url");
+    const redeem = await fetch(`${base}/r/${room.slug}/claim`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ claimCode: body.claimCode, tokenHash: sha256hex(token) }),
+    });
+    expect(redeem.status).toBe(201);
+    const rbody = await j(redeem as any);
+    expect(rbody.handle).toMatch(/^h_/);
+
+    // the guest's raw token now reads + posts
+    const post = await fetch(`${base}/r/${room.slug}`, {
+      method: "POST", headers: { "content-type": "application/json", ...bearer(token) },
+      body: JSON.stringify({ from: "alice", body: "claimed in" }),
+    });
+    expect(post.status).toBe(201);
+    const read = await fetch(`${base}/r/${room.slug}/messages.json`, { headers: bearer(token) });
+    expect(read.status).toBe(200);
+  });
+
+  it("minting a claim code requires the master secret", async () => {
+    const room = await makePrivateRoom();
+    const noAuth = await fetch(`${base}/r/${room.slug}/claims`, { method: "POST" });
+    expect(noAuth.status).toBe(401);
+  });
+
+  it("a claim code is single-use", async () => {
+    const room = await makePrivateRoom();
+    const { body } = await mintClaim(room);
+    const once = await fetch(`${base}/r/${room.slug}/claim`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ claimCode: body.claimCode, tokenHash: sha256hex("u_a") }),
+    });
+    expect(once.status).toBe(201);
+    const twice = await fetch(`${base}/r/${room.slug}/claim`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ claimCode: body.claimCode, tokenHash: sha256hex("u_b") }),
+    });
+    expect(twice.status).toBe(404);
+  });
+
+  it("rejects a malformed tokenHash", async () => {
+    const room = await makePrivateRoom();
+    const { body } = await mintClaim(room);
+    const bad = await fetch(`${base}/r/${room.slug}/claim`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ claimCode: body.claimCode, tokenHash: "not-a-hash" }),
+    });
+    expect(bad.status).toBe(400);
+  });
+
+  it("owner can revoke a claimed token by its handle (never having seen the token)", async () => {
+    const room = await makePrivateRoom();
+    const { body } = await mintClaim(room, "alice");
+    const token = "u_" + crypto.randomBytes(24).toString("base64url");
+    const redeem = await j(await fetch(`${base}/r/${room.slug}/claim`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ claimCode: body.claimCode, tokenHash: sha256hex(token) }),
+    }) as any);
+
+    // works before revoke
+    expect((await fetch(`${base}/r/${room.slug}/messages.json`, { headers: bearer(token) })).status).toBe(200);
+    // owner revokes by handle (the owner never saw `token`)
+    const del = await fetch(`${base}/r/${room.slug}/tokens/${redeem.handle}`, { method: "DELETE", headers: bearer(room.secret) });
+    expect(del.status).toBe(200);
+    // blocked after revoke
+    expect((await fetch(`${base}/r/${room.slug}/messages.json`, { headers: bearer(token) })).status).toBe(401);
+  });
+
+  it("lists claimed tokens with a handle for revocation", async () => {
+    const room = await makePrivateRoom();
+    const { body } = await mintClaim(room, "alice");
+    await fetch(`${base}/r/${room.slug}/claim`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ claimCode: body.claimCode, tokenHash: sha256hex("u_x") }),
+    });
+    const list = await j(await fetch(`${base}/r/${room.slug}/tokens`, { headers: bearer(room.secret) }) as any);
+    expect(list.tokens[0].handle).toMatch(/^h_/);
+    expect(list.tokens[0].label).toBe("alice");
+  });
+});
+
 describe("x402 quota", () => {
   it("returns 402 on message 11 with proper accepts body", async () => {
     const room = await fetch(base + "/", { method: "POST" }).then(j as any);

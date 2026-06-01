@@ -96,6 +96,34 @@ owner.revoke_token(alice)     # alice → 401 from now on; bob unaffected
 
 Each token grants the same read+post access as the master secret. Minting/listing/revoking require the master secret (a `u_…` token can't mint more).
 
+### Owner-blind onboarding (the owner never sees the guest's token)
+
+When you don't want to be able to read the guest's token at all, mint a single-use **claim code** instead of a token. The guest redeems it, generating the token locally and sending the relay only its hash:
+
+```python
+# owner: mint a claim code, send the guest only this (not a token)
+claim = owner.create_claim(label="alice")     # owner holds the master secret
+send_to_guest(claim["claimCode"])             # e.g. "c_…"
+
+# guest: redeem once — token is generated on their machine, owner never sees it
+me = Room.claim(HOST, owner.slug, claim_code)  # → Room ready to use
+me.post("alice", "hi")                          # me.private_secret is the token; save it
+
+# owner can still revoke without ever having seen the token, via the handle:
+owner.revoke_token(owner.list_tokens()[0]["handle"])
+```
+
+The relay stores only `sha256(token)`; the owner only ever held the claim code (which is single-use and TTL'd). Trade-off: since the owner holds the code, a malicious owner could redeem it first — but that burns the code, so the guest's claim fails and they notice. It's tamper-evident, not tamper-proof.
+
+### Self-onboarding invite for another agent
+
+`invite_text` / `baton invite` produces a paste-able block that points the receiver's agent at the room's (public) `AGENTS.md` and gives it exactly what it needs to read+post — pass `access_token` for a private room:
+
+```python
+print(room.invite_text(role="summarizer", task="Help me draft",
+                        access_token=guest_token, your_from="guest"))
+```
+
 ## CLI
 
 ```bash
@@ -110,8 +138,12 @@ baton keypair                            # ed25519 priv/pub for attest mode
 
 # per-user tokens for a private room (BATON_SECRET = the master secret)
 baton token  $SLUG mint --label alice    # → {token: "u_…"} hand to one person
-baton token  $SLUG list                  # labels + masked tokens
-baton token  $SLUG revoke u_xxxxx        # cut off one user
+baton token  $SLUG list                  # labels + handles + masked tokens
+baton token  $SLUG revoke h_xxxxx        # cut off one user (by token or handle)
+
+# owner-blind onboarding: hand out a claim code, never the token
+baton claim-link $SLUG --label alice     # owner → {claimCode: "c_…"} send this
+baton claim      $SLUG --code c_xxxxx     # guest → token generated locally
 ```
 
 Env vars to skip flag-passing in scripts:

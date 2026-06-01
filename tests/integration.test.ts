@@ -705,6 +705,33 @@ describe("per-user tokens (private rooms)", () => {
     const mint = await fetch(`${base}/r/${room.slug}/tokens`, { method: "POST" });
     expect(mint.status).toBe(400);
   });
+
+  it("mint returns a joinUrl whose manual carries the key + HTTP instructions", async () => {
+    const room = await j(await fetch(base + "/?private=1", { method: "POST" }) as any);
+    const mint = await j(await fetch(`${base}/r/${room.slug}/tokens`, {
+      method: "POST", headers: { "content-type": "application/json", "authorization": `Bearer ${room.secret}` },
+      body: JSON.stringify({ label: "alice" }),
+    }) as any);
+    expect(mint.joinUrl).toBe(`${base}/j/${room.slug}/${mint.token}`);
+
+    // GET the join link → self-contained markdown manual with the embedded key
+    const page = await fetch(mint.joinUrl);
+    expect(page.status).toBe(200);
+    expect(page.headers.get("content-type")).toMatch(/markdown/);
+    const md = await page.text();
+    expect(md).toContain(mint.token);                       // key embedded
+    expect(md).toContain(`${base}/r/${room.slug}`);         // channel url
+    expect(md).toContain("Authorization: Bearer");          // how to auth
+    expect(md.toLowerCase()).toContain("untrusted");        // trust warning
+
+    // a bad/revoked token returns 404 (doesn't confirm the room)
+    const bad = await fetch(`${base}/j/${room.slug}/u_not-a-real-token`);
+    expect(bad.status).toBe(404);
+
+    // after revoke, the join link dies
+    await fetch(`${base}/r/${room.slug}/tokens/${mint.token}`, { method: "DELETE", headers: { "authorization": `Bearer ${room.secret}` } });
+    expect((await fetch(mint.joinUrl)).status).toBe(404);
+  });
 });
 
 describe("owner-blind claim onboarding (private rooms)", () => {

@@ -2,7 +2,7 @@ import express, { Request, Response, NextFunction } from "express";
 import crypto from "node:crypto";
 import { makeStore, Store, Message, Room } from "./store.js";
 import { randomSlug, SLUG_RE } from "./slugs.js";
-import { landingHtml, roomHtml, rootAgentsMd, roomAgentsMd } from "./docs.js";
+import { landingHtml, roomHtml, rootAgentsMd, roomAgentsMd, joinManual } from "./docs.js";
 import {
   config as x402Config,
   buildRequirement,
@@ -244,8 +244,11 @@ export function createApp(store: Store = makeStore()) {
       handle,
       label,
       url: `${host}/r/${slug}`,
+      // The one clean link to hand to another agent: GET it and you get the
+      // key + a full HTTP manual, no install. The token is embedded.
+      joinUrl: `${host}/j/${slug}/${token}`,
       messagesUrl: `${host}/r/${slug}/messages.json`,
-      usage: `read/post with header: Authorization: Bearer ${token}`,
+      usage: `send someone the joinUrl; their agent opens it and can talk over HTTP immediately`,
     });
   });
 
@@ -323,6 +326,25 @@ export function createApp(store: Store = makeStore()) {
       url: `${hostFor(req)}/r/${slug}`,
       note: "registered. read/post with Authorization: Bearer <your token>. Keep the token; it cannot be recovered.",
     });
+  });
+
+  // Join link: the single shareable URL. An agent that opens it gets its key
+  // (already in the URL) plus a self-contained HTTP manual — no install. The
+  // same token is a normal per-user bearer, so access is revocable as usual.
+  app.get("/j/:slug/:token", async (req, res) => {
+    const slug = req.params.slug;
+    const token = req.params.token;
+    if (!SLUG_RE.test(slug)) return res.status(400).send("bad slug");
+    const room = await store.getRoom(slug);
+    if (!room) return res.status(404).send("not found");
+    // Validate the embedded token: minted tokens are stored by value, claimed
+    // ones by sha256. A bad/revoked token gets a 404 (don't confirm the room).
+    const ok = (await store.getUserToken(slug, token)) !== null
+      || (await store.getUserToken(slug, sha256hex(token))) !== null;
+    if (!ok) return res.status(404).send("invalid or revoked join link");
+    res.set("cache-control", "no-store, no-cache, must-revalidate, private");
+    res.type("text/markdown; charset=utf-8")
+       .send(joinManual(hostFor(req), slug, token));
   });
 
   app.get("/r/:slug", async (req, res) => {

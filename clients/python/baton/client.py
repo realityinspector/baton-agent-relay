@@ -170,6 +170,20 @@ class Room:
                         headers=self._master_auth(), body={"label": label})
         return resp["token"]
 
+    def create_invite(self, label: str = "") -> dict:
+        """Mint a token and return the single shareable join link for it.
+
+        Returns {token, handle, joinUrl, label}. Send someone the `joinUrl`:
+        their agent opens that one URL and gets the key plus a full HTTP manual
+        — no install. Requires this Room to hold the master secret.
+        """
+        return _request(self.url + "/tokens", method="POST",
+                        headers=self._master_auth(), body={"label": label})
+
+    def join_url(self, token: str) -> str:
+        """The shareable join link for a token: GET it to receive key + manual."""
+        return f"{self.base_url.rstrip('/')}/j/{self.slug}/{token}"
+
     def list_tokens(self) -> list[dict]:
         """List minted tokens (masked) for audit: [{label, token, createdAt}]."""
         return _request(self.url + "/tokens", method="GET",

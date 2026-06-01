@@ -88,12 +88,13 @@ def cmd_token(args: argparse.Namespace) -> int:
         print("baton: token ops need the master secret (--secret or $BATON_SECRET)", file=sys.stderr)
         return 1
     if args.token_cmd == "mint":
-        token = room.mint_token(label=args.label or "")
+        inv = room.create_invite(label=args.label or "")
         print(json.dumps({
-            "token": token,
+            "token": inv["token"],
+            "handle": inv.get("handle"),
             "label": args.label or "",
-            "url": room.url,
-            "usage": f"the holder reads/posts with: --secret {token}  (or Authorization: Bearer {token})",
+            "joinUrl": inv.get("joinUrl"),
+            "shareThis": "send someone the joinUrl — their agent opens it and gets the key + HTTP manual, no install",
         }, indent=2))
     elif args.token_cmd == "list":
         print(json.dumps(room.list_tokens(), indent=2))

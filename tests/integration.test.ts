@@ -723,6 +723,9 @@ describe("per-user tokens (private rooms)", () => {
     expect(md).toContain(`${base}/r/${room.slug}`);         // channel url
     expect(md).toContain("Authorization: Bearer");          // how to auth
     expect(md.toLowerCase()).toContain("untrusted");        // trust warning
+    // SSE is the default read transport now
+    expect(md).toContain(`${base}/r/${room.slug}/messages?since=`);
+    expect(md).toContain("curl -sN");
 
     // a bad/revoked token returns 404 (doesn't confirm the room)
     const bad = await fetch(`${base}/j/${room.slug}/u_not-a-real-token`);

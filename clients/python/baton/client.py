@@ -152,6 +152,90 @@ class Room:
         """The room's _meta envelope — describes the trust model self-descriptively."""
         return self._get("/messages.json?since=99999999")["_meta"]
 
+    def stream(self, *, since: Optional[int] = None, reconnect: bool = True,
+               idle_timeout: Optional[float] = None):
+        """Yield messages live over SSE (server push) from GET /r/<slug>/messages.
+
+        Where read()/volley() long-poll, this holds one streaming connection
+        and the server pushes each new message as it lands — lower latency and
+        no token-linear re-requests, the right transport for a long-lived
+        agent. Resumes via Last-Event-ID on reconnect so a dropped connection
+        doesn't lose messages. The backlog after `since` is replayed first,
+        then live frames. Encrypted-room bodies are decrypted in place exactly
+        like read(). Stdlib only.
+
+        This is a generator — iterate it to consume Message objects:
+
+            for m in room.stream(since=0):
+                print(m.from_, m.body)
+
+        since:        start after this id (default: self._last_id). Tracks
+                      forward as messages arrive, so resume is automatic.
+        reconnect:    auto-reconnect on network drop / clean server close
+                      (default True). False stops on the first disconnect.
+        idle_timeout: if no frame — including the server's ~25s keepalive —
+                      arrives within this many seconds, reconnect (or stop if
+                      reconnect=False). None blocks indefinitely. Pick > 25 to
+                      avoid tripping on a healthy idle connection.
+        """
+        last_id = since if since is not None else self._last_id
+        while True:
+            headers = {"accept": "text/event-stream"}
+            if self.private_secret:
+                headers["authorization"] = f"Bearer {self.private_secret}"
+            # Last-Event-ID is the SSE-native resume cursor; ?since= covers the
+            # initial connect and any proxy/client that drops the header.
+            if last_id:
+                headers["last-event-id"] = str(last_id)
+            req = urllib.request.Request(
+                f"{self.url}/messages?since={last_id}", headers=headers, method="GET")
+            try:
+                with urllib.request.urlopen(req, timeout=idle_timeout) as r:
+                    event: Optional[str] = None
+                    for raw in r:
+                        line = raw.decode("utf-8", "replace").rstrip("\n")
+                        if line == "":
+                            event = None          # end of one SSE frame
+                            continue
+                        if line.startswith(":"):
+                            continue              # keepalive / comment
+                        if line.startswith("event:"):
+                            event = line[6:].strip()
+                            continue
+                        if line.startswith("id:"):
+                            continue              # id is also on the body; track it there
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if event == "meta" or not data:
+                            continue              # trust-model frame, not a message
+                        try:
+                            d = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        m = Message.from_json(d)
+                        self._last_id = last_id = m.id
+                        if m.hash:
+                            self._last_hash = m.hash
+                        if self.encryption_key and m.body.startswith(_ENC_PREFIX):
+                            try:
+                                m.body = _decrypt_body(self.encryption_key, m.body, m.from_)
+                                m.encrypted = True
+                            except Exception as e:
+                                m.decrypt_error = f"{type(e).__name__}: {e}"
+                        yield m
+            except (urllib.error.URLError, TimeoutError, OSError):
+                # network drop / idle timeout — reconnect from last_id (no
+                # missed messages) unless the caller opted out.
+                if not reconnect:
+                    return
+                time.sleep(1.0)
+                continue
+            # Clean EOF: server closed the stream. Reconnect or stop.
+            if not reconnect:
+                return
+            time.sleep(0.5)
+
     # --- per-user tokens (private rooms) ---
     #
     # A private room has one master secret (`private_secret`). To let several

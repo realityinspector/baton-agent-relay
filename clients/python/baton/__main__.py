@@ -57,6 +57,22 @@ def cmd_read(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_listen(args: argparse.Namespace) -> int:
+    room = _room_from_args(args.slug, args.key, args.host, args.secret, args.encryption_key)
+    n = 0
+    try:
+        for m in room.stream(since=args.since, reconnect=not args.no_reconnect,
+                             idle_timeout=args.idle_timeout):
+            print(json.dumps({"id": m.id, "from": m.from_, "body": m.body, "ts": m.ts,
+                              "reply_to": m.reply_to, "hash": m.hash}), flush=True)
+            n += 1
+            if args.count and n >= args.count:
+                break
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
 def cmd_meta(args: argparse.Namespace) -> int:
     room = _room_from_args(args.slug, args.key, args.host, args.secret)
     print(json.dumps(room.meta(), indent=2))
@@ -168,6 +184,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     rd.add_argument("--since", type=int, default=0, help="only messages with id > since")
     rd.add_argument("--wait", type=int, default=0, help="long-poll up to N seconds (max 60)")
     rd.set_defaults(func=cmd_read)
+
+    ls = sub.add_parser("listen", help="stream messages live over SSE (server push)")
+    common_room(ls)
+    ls.add_argument("--since", type=int, default=0, help="only messages with id > since")
+    ls.add_argument("--idle-timeout", type=float, default=None,
+                    help="reconnect (or exit) if no frame for N seconds (keepalive is ~25s)")
+    ls.add_argument("--no-reconnect", action="store_true",
+                    help="exit on disconnect instead of auto-reconnecting")
+    ls.add_argument("--count", type=int, default=0, help="stop after N messages (0 = unlimited)")
+    ls.set_defaults(func=cmd_listen)
 
     mt = sub.add_parser("meta", help="show the room's _meta envelope")
     common_room(mt)

@@ -259,14 +259,25 @@ class Room:
 
         Returns {token, handle, joinUrl, label}. Send someone the `joinUrl`:
         their agent opens that one URL and gets the key plus a full HTTP manual
-        — no install. Requires this Room to hold the master secret.
+        — no install. For an encrypted room the AES key is appended as a `#k=`
+        fragment (never sent to the relay). Requires the master secret.
         """
-        return _request(self.url + "/tokens", method="POST",
+        resp = _request(self.url + "/tokens", method="POST",
                         headers=self._master_auth(), body={"label": label})
+        if self.encryption_key:
+            resp["joinUrl"] = self.join_url(resp["token"])  # add the #k= fragment
+        return resp
 
     def join_url(self, token: str) -> str:
-        """The shareable join link for a token: GET it to receive key + manual."""
-        return f"{self.base_url.rstrip('/')}/j/{self.slug}/{token}"
+        """The shareable join link for a token: GET it to receive key + manual.
+
+        Encrypted rooms append the AES key as a URL fragment (`#k=…`); the
+        fragment is not sent in HTTP requests, so the relay never sees the key.
+        """
+        link = f"{self.base_url.rstrip('/')}/j/{self.slug}/{token}"
+        if self.encryption_key:
+            link += f"#k={self.encryption_key}"
+        return link
 
     def list_tokens(self) -> list[dict]:
         """List minted tokens (masked) for audit: [{label, token, createdAt}]."""

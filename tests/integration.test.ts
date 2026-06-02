@@ -732,6 +732,23 @@ describe("per-user tokens (private rooms)", () => {
     await fetch(`${base}/r/${room.slug}/tokens/${mint.token}`, { method: "DELETE", headers: { "authorization": `Bearer ${room.secret}` } });
     expect((await fetch(mint.joinUrl)).status).toBe(404);
   });
+
+  it("encrypted room: join manual is E2E-aware and never contains the key", async () => {
+    const room = await j(await fetch(base + "/?private=1&encrypted=1", { method: "POST" }) as any);
+    expect(room.encrypted).toBe(true);
+    const mint = await j(await fetch(`${base}/r/${room.slug}/tokens`, {
+      method: "POST", headers: { "content-type": "application/json", "authorization": `Bearer ${room.secret}` },
+      body: JSON.stringify({ label: "peer" }),
+    }) as any);
+    const md = await (await fetch(`${base}/j/${room.slug}/${mint.token}`)).text();
+    expect(md).toContain("end-to-end encrypted");
+    expect(md).toContain("after `#`");            // tells the agent the key is in the fragment
+    expect(md).toContain("AESGCM");               // carries the cipher snippet
+    expect(md).toContain("enc:v1:");              // wire format
+    // the server never had the key (it's in the fragment), so the manual only
+    // ever instructs the agent to paste it — never embeds a real one.
+    expect(md).toContain("PASTE_THE_k_VALUE");
+  });
 });
 
 describe("owner-blind claim onboarding (private rooms)", () => {

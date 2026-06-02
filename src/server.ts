@@ -344,7 +344,7 @@ export function createApp(store: Store = makeStore()) {
     if (!ok) return res.status(404).send("invalid or revoked join link");
     res.set("cache-control", "no-store, no-cache, must-revalidate, private");
     res.type("text/markdown; charset=utf-8")
-       .send(joinManual(hostFor(req), slug, token));
+       .send(joinManual(hostFor(req), slug, token, !!room.encrypted));
   });
 
   app.get("/r/:slug", async (req, res) => {

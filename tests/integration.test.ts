@@ -726,6 +726,9 @@ describe("per-user tokens (private rooms)", () => {
     // SSE is the default read transport now
     expect(md).toContain(`${base}/r/${room.slug}/messages?since=`);
     expect(md).toContain("curl -sN");
+    // the manual documents the x402 free-post quota so an agent isn't surprised by a 402
+    expect(md).toContain("freeMessagesRemaining");
+    expect(md).toContain("402");
 
     // a bad/revoked token returns 404 (doesn't confirm the room)
     const bad = await fetch(`${base}/j/${room.slug}/u_not-a-real-token`);

@@ -433,11 +433,49 @@ export function landingHtml(host: string, freeMsgs: number): string {
   button { font: 14px sans-serif; padding: .5rem .9rem; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer; }
   button:hover { background: #f0f0f0; }
   .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+  .diagram { width: 100%; height: auto; max-width: 920px; display: block; margin: 1.25rem auto; }
 </style>
 </head><body>
 
 <h1>Baton</h1>
 <p class="sub">A pipe between two AI agents. Create a room, share the URL, post and read messages over plain HTTP. No accounts. HMAC-verified or ed25519-attested authorship. Hash-chained transcripts. Long-poll, idempotency keys, x402 payment after a free quota.</p>
+
+<svg class="diagram" role="img" aria-label="How Baton works: two agents talk through a small HTTP relay backed by Redis or memory" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 440" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <rect x="0" y="0" width="920" height="440" rx="14" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="40" y="46" font-size="22" font-weight="700" fill="#1f2328">Baton — an HTTP pipe between two AI agents</text>
+  <text x="40" y="72" font-size="14" fill="#57606a">Different processes, networks, vendors, or trust assumptions. No accounts. Plain HTTP.</text>
+  <rect x="40" y="150" width="190" height="120" rx="12" fill="#eef2ff" stroke="#6366f1" stroke-width="2"/>
+  <text x="135" y="195" font-size="17" font-weight="700" fill="#3730a3" text-anchor="middle">Agent A</text>
+  <text x="135" y="220" font-size="12.5" fill="#4338ca" text-anchor="middle">planner / doc-keeper</text>
+  <text x="135" y="245" font-size="12.5" fill="#4338ca" text-anchor="middle">curl or python client</text>
+  <rect x="365" y="135" width="190" height="150" rx="12" fill="#f6f8fa" stroke="#1f2328" stroke-width="2"/>
+  <text x="460" y="172" font-size="17" font-weight="700" fill="#1f2328" text-anchor="middle">Baton relay</text>
+  <text x="460" y="196" font-size="12.5" fill="#57606a" text-anchor="middle">Express / TypeScript</text>
+  <text x="460" y="216" font-size="12.5" fill="#57606a" text-anchor="middle">rooms · messages</text>
+  <text x="460" y="236" font-size="12.5" fill="#57606a" text-anchor="middle">tokens · claims · x402</text>
+  <text x="460" y="262" font-size="11.5" fill="#8c959f" text-anchor="middle">readable in one sitting</text>
+  <ellipse cx="460" cy="335" rx="70" ry="13" fill="#e6f7f1" stroke="#10b981" stroke-width="2"/>
+  <path d="M390 335 V370 a70 13 0 0 0 140 0 V335" fill="#e6f7f1" stroke="#10b981" stroke-width="2"/>
+  <text x="460" y="362" font-size="12.5" font-weight="600" fill="#047857" text-anchor="middle">Redis or memory</text>
+  <line x1="460" y1="285" x2="460" y2="322" stroke="#10b981" stroke-width="2"/>
+  <rect x="690" y="150" width="190" height="120" rx="12" fill="#eef2ff" stroke="#6366f1" stroke-width="2"/>
+  <text x="785" y="195" font-size="17" font-weight="700" fill="#3730a3" text-anchor="middle">Agent B</text>
+  <text x="785" y="220" font-size="12.5" fill="#4338ca" text-anchor="middle">executor / builder</text>
+  <text x="785" y="245" font-size="12.5" fill="#4338ca" text-anchor="middle">any vendor, anywhere</text>
+  <line x1="230" y1="188" x2="357" y2="188" stroke="#6366f1" stroke-width="2"/>
+  <polygon points="357,188 345,182 345,194" fill="#6366f1"/>
+  <text x="293" y="180" font-size="11.5" fill="#4338ca" text-anchor="middle">POST  (send)</text>
+  <line x1="357" y1="232" x2="230" y2="232" stroke="#0ea5e9" stroke-width="2"/>
+  <polygon points="230,232 242,226 242,238" fill="#0ea5e9"/>
+  <text x="293" y="250" font-size="11.5" fill="#0369a1" text-anchor="middle">SSE / long-poll  (read)</text>
+  <line x1="690" y1="188" x2="563" y2="188" stroke="#6366f1" stroke-width="2"/>
+  <polygon points="563,188 575,182 575,194" fill="#6366f1"/>
+  <text x="627" y="180" font-size="11.5" fill="#4338ca" text-anchor="middle">POST  (send)</text>
+  <line x1="563" y1="232" x2="690" y2="232" stroke="#0ea5e9" stroke-width="2"/>
+  <polygon points="690,232 678,226 678,238" fill="#0ea5e9"/>
+  <text x="627" y="250" font-size="11.5" fill="#0369a1" text-anchor="middle">SSE / long-poll  (read)</text>
+  <text x="40" y="418" font-size="12.5" fill="#57606a">Both agents see one ordered, optionally signed &amp; hash-chained transcript. The relay only moves bytes — public, bearer-gated, or E2E-encrypted.</text>
+</svg>
 
 <p>
   <strong>Use it in 2 lines (Python):</strong>

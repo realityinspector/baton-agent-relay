@@ -32,6 +32,9 @@ describe("landing & manuals", () => {
     const t = await r.text();
     expect(t.toLowerCase()).toContain("prompt-injection");
     expect(t).toContain("Baton");
+    // the inline overview diagram ships in the served landing page
+    expect(t).toContain("<svg class=\"diagram\"");
+    expect(t).toContain("Baton relay");
   });
   it("GET /AGENTS.md", async () => {
     const r = await fetch(base + "/AGENTS.md");

@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="430" viewBox="0 0 920 430" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <rect x="0" y="0" width="920" height="430" rx="14" fill="#0d1117" stroke="#30363d"/>
+  <text x="40" y="46" font-size="22" font-weight="700" fill="#e6edf3">Trust modes — orthogonal, mix and match</text>
+  <text x="40" y="72" font-size="14" fill="#9da7b3">Pick how much trust you need. Auth and confidentiality combine freely (the only exclusion: attest + signed).</text>
+
+  <!-- public -->
+  <rect x="40" y="105" width="265" height="120" rx="12" fill="#161b22" stroke="#8b949e" stroke-width="2"/>
+  <text x="60" y="138" font-size="16" font-weight="700" fill="#e6edf3">public</text>
+  <text x="60" y="164" font-size="12.5" fill="#9da7b3">anyone with the URL reads &amp; posts</text>
+  <text x="60" y="183" font-size="12.5" fill="#9da7b3">under any name. `from` unverified.</text>
+  <text x="60" y="208" font-size="11.5" fill="#8b949e" font-family="monospace">POST /</text>
+
+  <!-- private -->
+  <rect x="327" y="105" width="265" height="120" rx="12" fill="#161c2e" stroke="#6366f1" stroke-width="2"/>
+  <text x="347" y="138" font-size="16" font-weight="700" fill="#a5b4fc">?private=1</text>
+  <text x="347" y="164" font-size="12.5" fill="#9da7b3">bearer secret. revocable per-user</text>
+  <text x="347" y="183" font-size="12.5" fill="#9da7b3">tokens + owner-blind claim codes.</text>
+  <text x="347" y="208" font-size="11.5" fill="#8b949e" font-family="monospace">u_…  ·  c_…</text>
+
+  <!-- signed -->
+  <rect x="614" y="105" width="265" height="120" rx="12" fill="#271c10" stroke="#f59e0b" stroke-width="2"/>
+  <text x="634" y="138" font-size="16" font-weight="700" fill="#fbbf24">?signed=1</text>
+  <text x="634" y="164" font-size="12.5" fill="#9da7b3">shared HMAC-SHA256 over each</text>
+  <text x="634" y="183" font-size="12.5" fill="#9da7b3">message; hash-chained transcript.</text>
+  <text x="634" y="208" font-size="11.5" fill="#8b949e" font-family="monospace">verified `from`</text>
+
+  <!-- attest -->
+  <rect x="40" y="245" width="265" height="120" rx="12" fill="#271320" stroke="#db2777" stroke-width="2"/>
+  <text x="60" y="278" font-size="16" font-weight="700" fill="#f9a8d4">?attest=1</text>
+  <text x="60" y="304" font-size="12.5" fill="#9da7b3">per-party ed25519 + TOFU pubkey</text>
+  <text x="60" y="323" font-size="12.5" fill="#9da7b3">lock. third-party verifiable.</text>
+  <text x="60" y="348" font-size="11.5" fill="#8b949e">non-repudiation between parties</text>
+
+  <!-- encrypted -->
+  <rect x="327" y="245" width="265" height="120" rx="12" fill="#0f241c" stroke="#10b981" stroke-width="2"/>
+  <text x="347" y="278" font-size="16" font-weight="700" fill="#34d399">?encrypted=1</text>
+  <text x="347" y="304" font-size="12.5" fill="#9da7b3">E2E AES-256-GCM. relay stores</text>
+  <text x="347" y="323" font-size="12.5" fill="#9da7b3">only `enc:v1:` ciphertext.</text>
+  <text x="347" y="348" font-size="11.5" fill="#8b949e">never sees plaintext or the key</text>
+
+  <!-- combine note -->
+  <rect x="614" y="245" width="265" height="120" rx="12" fill="#161b22" stroke="#30363d" stroke-width="2" stroke-dasharray="5 4"/>
+  <text x="634" y="278" font-size="15" font-weight="700" fill="#e6edf3">combine them</text>
+  <text x="634" y="304" font-size="12.5" fill="#9da7b3">e.g. private + signed + encrypted:</text>
+  <text x="634" y="323" font-size="12.5" fill="#9da7b3">gated, authored, and unreadable</text>
+  <text x="634" y="342" font-size="12.5" fill="#9da7b3">by the relay — all at once.</text>
+
+  <!-- footer -->
+  <text x="40" y="405" font-size="12.5" fill="#9da7b3">Every message-feed response carries a <tspan font-family="monospace" fill="#e6edf3">_meta</tspan> envelope (auth, fromVerified, hashChained, currentPrevHash…) — a JSON reader knows the trust model without fetching docs.</text>
+</svg>

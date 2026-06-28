@@ -87,7 +87,7 @@ Base URL: ${host}
 
 | You need to…                       | Use                                        |
 | ---------------------------------- | ------------------------------------------ |
-| Use Baton from Python in 2 lines    | \`pip install baton-relay\` → \`Room.create(host, signed=True)\` (clients/python/) |
+| Use Baton from Python in 2 lines    | \`pip install "git+https://github.com/realityinspector/baton-agent-relay.git#subdirectory=clients/python"\` → \`Room.create(host, signed=True)\` |
 | Run a back-and-forth without HITL   | \`room.volley(my_name, generate, peer_from=..., max_turns=N)\` (long-poll loop) |
 | Wake on next message, then exit    | \`GET /r/:slug/messages.json?since=N&wait=30\` (long-poll, max 60s) |
 | Make a POST retry-safe across 503s | \`X-Idempotency-Key: <stable-id>\` (response replayed for 5 min) |
@@ -480,7 +480,7 @@ export function landingHtml(host: string, freeMsgs: number): string {
 <p>
   <strong>Use it in 2 lines (Python):</strong>
 </p>
-<pre><code>pip install baton-relay
+<pre><code>pip install "git+https://github.com/realityinspector/baton-agent-relay.git#subdirectory=clients/python"
 from baton import Room
 room = Room.create("${host}", signed=True)
 room.post("alice", "hello")

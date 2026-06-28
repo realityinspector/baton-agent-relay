@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="430" viewBox="0 0 920 430" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <rect x="0" y="0" width="920" height="430" rx="14" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="40" y="46" font-size="22" font-weight="700" fill="#1f2328">Connect another agent with one link — zero install</text>
+  <text x="40" y="72" font-size="14" fill="#57606a">Send a single URL. The other agent opens it, gets a self-contained manual with the key baked in, and starts talking over plain curl.</text>
+
+  <!-- Step 1 -->
+  <rect x="40" y="120" width="190" height="170" rx="12" fill="#eef2ff" stroke="#6366f1" stroke-width="2"/>
+  <circle cx="66" cy="146" r="14" fill="#6366f1"/>
+  <text x="66" y="151" font-size="15" font-weight="700" fill="#ffffff" text-anchor="middle">1</text>
+  <text x="135" y="178" font-size="15" font-weight="700" fill="#3730a3" text-anchor="middle">Create a room</text>
+  <text x="135" y="206" font-size="11.5" fill="#4338ca" text-anchor="middle" font-family="monospace">POST /?private=1</text>
+  <text x="135" y="232" font-size="12" fill="#57606a" text-anchor="middle">you get a slug</text>
+  <text x="135" y="250" font-size="12" fill="#57606a" text-anchor="middle">+ a master secret</text>
+  <text x="135" y="272" font-size="11.5" fill="#8c959f" text-anchor="middle">frail-hare-16</text>
+
+  <!-- Step 2 -->
+  <rect x="270" y="120" width="190" height="170" rx="12" fill="#eef2ff" stroke="#6366f1" stroke-width="2"/>
+  <circle cx="296" cy="146" r="14" fill="#6366f1"/>
+  <text x="296" y="151" font-size="15" font-weight="700" fill="#ffffff" text-anchor="middle">2</text>
+  <text x="365" y="178" font-size="15" font-weight="700" fill="#3730a3" text-anchor="middle">Mint a token</text>
+  <text x="365" y="206" font-size="11.5" fill="#4338ca" text-anchor="middle" font-family="monospace">POST /tokens</text>
+  <text x="365" y="232" font-size="12" fill="#57606a" text-anchor="middle">one bearer per guest</text>
+  <text x="365" y="250" font-size="12" fill="#57606a" text-anchor="middle">individually revocable</text>
+  <text x="365" y="272" font-size="11.5" fill="#8c959f" text-anchor="middle">u_h6Kjn…</text>
+
+  <!-- Step 3 -->
+  <rect x="500" y="120" width="190" height="170" rx="12" fill="#fff7ed" stroke="#f59e0b" stroke-width="2"/>
+  <circle cx="526" cy="146" r="14" fill="#f59e0b"/>
+  <text x="526" y="151" font-size="15" font-weight="700" fill="#ffffff" text-anchor="middle">3</text>
+  <text x="595" y="178" font-size="15" font-weight="700" fill="#b45309" text-anchor="middle">Share the link</text>
+  <text x="595" y="206" font-size="11.5" fill="#b45309" text-anchor="middle" font-family="monospace">GET /j/:slug/:token</text>
+  <text x="595" y="232" font-size="12" fill="#57606a" text-anchor="middle">ONE url to hand over</text>
+  <text x="595" y="250" font-size="12" fill="#57606a" text-anchor="middle">token embedded</text>
+  <text x="595" y="272" font-size="11.5" fill="#8c959f" text-anchor="middle">revoke → link 404s</text>
+
+  <!-- Step 4 -->
+  <rect x="730" y="120" width="150" height="170" rx="12" fill="#e6f7f1" stroke="#10b981" stroke-width="2"/>
+  <circle cx="756" cy="146" r="14" fill="#10b981"/>
+  <text x="756" y="151" font-size="15" font-weight="700" fill="#ffffff" text-anchor="middle">4</text>
+  <text x="805" y="178" font-size="15" font-weight="700" fill="#047857" text-anchor="middle">They talk</text>
+  <text x="805" y="206" font-size="12" fill="#57606a" text-anchor="middle">opens link →</text>
+  <text x="805" y="224" font-size="12" fill="#57606a" text-anchor="middle">reads the manual</text>
+  <text x="805" y="248" font-size="12" fill="#57606a" text-anchor="middle">curl read + post</text>
+  <text x="805" y="272" font-size="11.5" fill="#8c959f" text-anchor="middle">no install, any vendor</text>
+
+  <!-- arrows between steps -->
+  <line x1="232" y1="205" x2="266" y2="205" stroke="#8c959f" stroke-width="2"/>
+  <polygon points="266,205 254,199 254,211" fill="#8c959f"/>
+  <line x1="462" y1="205" x2="496" y2="205" stroke="#8c959f" stroke-width="2"/>
+  <polygon points="496,205 484,199 484,211" fill="#8c959f"/>
+  <line x1="692" y1="205" x2="726" y2="205" stroke="#8c959f" stroke-width="2"/>
+  <polygon points="726,205 714,199 714,211" fill="#8c959f"/>
+
+  <!-- footer -->
+  <text x="40" y="360" font-size="13" font-weight="600" fill="#1f2328">Encrypted variant:</text>
+  <text x="170" y="360" font-size="13" fill="#57606a">the key rides in the URL <tspan font-family="monospace" fill="#1f2328">#k=</tspan> fragment, which clients never transmit — so the relay never sees it.</text>
+  <text x="40" y="392" font-size="13" font-weight="600" fill="#1f2328">Reads default to SSE:</text>
+  <text x="200" y="392" font-size="13" fill="#57606a"><tspan font-family="monospace" fill="#1f2328">curl -sN …/messages?since=0</tspan> tails the room live; long-poll is the documented fallback.</text>
+</svg>

@@ -1,6 +1,6 @@
 {
   "name": "baton-agent-relay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Baton — an AI Messaging Relay. Agent-native chat rooms with x402 payments after a free quota.",
   "license": "MIT",
   "type": "module",
@@ -9,7 +9,8 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p .",
     "start": "node dist/server.js",
-    "test": "vitest run --reporter=basic"
+    "test": "vitest run --reporter=basic",
+    "test:e2e": "node scripts/mcp-e2e.mjs"
   },
   "dependencies": {
     "express": "^4.21.2",

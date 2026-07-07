@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import { makeStore, Store, Message, Room } from "./store.js";
 import { randomSlug, SLUG_RE } from "./slugs.js";
 import { landingHtml, roomHtml, rootAgentsMd, roomAgentsMd, joinManual } from "./docs.js";
+import { handleMcpPost, handleMcpOther } from "./mcp.js";
 import {
   config as x402Config,
   buildRequirement,
@@ -13,7 +14,11 @@ import {
 export function createApp(store: Store = makeStore()) {
   const app = express();
   app.disable("x-powered-by");
-  app.set("trust proxy", true);
+  // Trust exactly one proxy hop (Railway's edge; the loopback hop for MCP
+  // tool dispatch) rather than `true`: trusting every hop makes req.ip the
+  // LEFTMOST X-Forwarded-For entry, which the client controls — a spoofable
+  // per-IP rate-limit key. Override hop count via BATON_TRUST_PROXY_HOPS.
+  app.set("trust proxy", Number(process.env.BATON_TRUST_PROXY_HOPS ?? 1));
   // 64kb to comfortably cover a 16k body + headers + protocol fields.
   app.use(express.json({ limit: "64kb" }));
 
@@ -64,6 +69,13 @@ export function createApp(store: Store = makeStore()) {
        .send(rootAgentsMd(hostFor(req), x402Config().freeMessages));
   });
   app.get("/healthz", (_req, res) => res.json({ ok: true }));
+
+  // --- MCP endpoint (JSON-RPC 2.0 over Streamable HTTP, stateless) ---
+  // Tool calls dispatch back into the routes below via loopback, so they get
+  // the same validation/auth/quota/rate-limit treatment as raw HTTP clients.
+  app.post("/mcp", handleMcpPost(hostFor));
+  app.get("/mcp", handleMcpOther());
+  app.delete("/mcp", handleMcpOther());
 
   // --- create room ---
   app.post("/", async (req, res) => {
@@ -660,8 +672,19 @@ export function createApp(store: Store = makeStore()) {
   // 404 fallthrough
   app.use((_req, res) => res.status(404).json({ error: "not_found" }));
 
-  // error handler
-  app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+  // error handler. Body-parser failures are client mistakes, not server
+  // faults: unparseable JSON to /mcp gets the JSON-RPC -32700 Parse error the
+  // MCP spec mandates (HTTP 200); elsewhere they map to plain 400/413.
+  app.use((err: any, req: Request, res: Response, _next: NextFunction) => {
+    if (err?.type === "entity.parse.failed" || err?.type === "entity.too.large") {
+      if (req.path === "/mcp") {
+        const code = err.type === "entity.parse.failed" ? -32700 : -32600;
+        const message = err.type === "entity.parse.failed" ? "Parse error" : "request too large";
+        return res.status(200).json({ jsonrpc: "2.0", id: null, error: { code, message } });
+      }
+      const status = err.type === "entity.parse.failed" ? 400 : 413;
+      return res.status(status).json({ error: err.type === "entity.parse.failed" ? "invalid_json" : "payload_too_large" });
+    }
     console.error("err", err);
     res.status(500).json({ error: "server_error" });
   });

@@ -86,6 +86,9 @@ export async function verifyAndSettle(
   catch { return { ok: false, reason: "invalid_payload" }; }
 
   try {
+    // Facilitator calls are attacker-triggerable (any post past quota with an
+    // X-Payment header) — bound them so a slow facilitator can't pile up
+    // open outbound connections.
     const verifyRes = await fetch(`${c.facilitatorUrl}/verify`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -94,6 +97,7 @@ export async function verifyAndSettle(
         paymentPayload: payload,
         paymentRequirements: requirement,
       }),
+      signal: AbortSignal.timeout(10_000),
     });
     if (!verifyRes.ok) return { ok: false, reason: `verify_${verifyRes.status}` };
     const verify = await verifyRes.json() as any;
@@ -107,6 +111,7 @@ export async function verifyAndSettle(
         paymentPayload: payload,
         paymentRequirements: requirement,
       }),
+      signal: AbortSignal.timeout(10_000),
     });
     if (!settleRes.ok) return { ok: false, reason: `settle_${settleRes.status}` };
     const settle = await settleRes.json() as any;

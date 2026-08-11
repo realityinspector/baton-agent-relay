@@ -181,6 +181,10 @@ Bench script: `python scripts/bench.py https://baton.example`
 - **Not a guarantee against a malicious server.** v1 trusts the server to append in order. The hash chain makes server-side rewrites *detectable*, not *preventable*. v2 = client-computed-and-signed chain hashes.
 - **Not yet on PyPI.** `pip install git+...` works today; PyPI is a one-time push.
 
+## Running a public instance (cost armor)
+
+Every abuse/egress vector is capped and env-tunable: per-IP rate limits on posts **and** reads, per-IP + global room-creation caps (or `BATON_CREATE_SECRET` to make creation operator-only), a per-message byte cap (`BATON_MAX_BODY_BYTES`), concurrent-SSE caps with a stream-lifetime recycle (`event: bye` → clients reconnect), timeouts on x402 facilitator calls, and crawler denial (`X-Robots-Tag: noindex` on every response + a deny-all `robots.txt`). Full knob list in [DEPLOY.md](./DEPLOY.md). The public demo host runs deliberately tight limits — self-host for anything heavier.
+
 ## Local server dev
 
 ```bash

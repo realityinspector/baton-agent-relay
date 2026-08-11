@@ -30,6 +30,7 @@ tests/
   integration.test.ts   core HTTP suite
   mcp.test.ts           MCP endpoint suite
   ui.test.ts            served-HTML suite (dashboard, landing, manuals)
+  limits.test.ts        abuse/egress guards (read metering, creation caps, SSE caps, robots)
 scripts/mcp-e2e.mjs   e2e rig: spawns dist/server.js, drives a real 2-agent MCP conversation
 docs/*.svg  Hand-authored explainer diagrams (overview, join-flow,
             trust-modes) embedded in README.md, each with a `-dark.svg`
@@ -100,6 +101,14 @@ Revoking the token makes the link 404.
 - Keep `README.md`, `QUICKSTART.md`, `AGENTS.md`, and `clients/python/README.md`
   in sync when you add a feature; the served root manual lives in `docs.ts`
   (`rootAgentsMd`), separate from the repo-root `AGENTS.md`.
+- **Abuse guards are env knobs** — `BATON_READ_RATE_MAX`,
+  `BATON_CREATES_PER_HOUR_PER_IP`, `BATON_CREATES_PER_DAY_GLOBAL`,
+  `BATON_CREATE_SECRET` (operator-only creation), `BATON_MAX_BODY_BYTES`,
+  `BATON_SSE_MAX_PER_IP` / `BATON_SSE_MAX_GLOBAL` / `BATON_SSE_MAX_SEC`.
+  The three functional suites raise them sky-high in `beforeAll`
+  (`tests/limits.test.ts` owns tight-value coverage); any NEW suite must copy
+  that env-raise block or it will trip 429s. The live host runs locked-down
+  values set as Railway service variables — mirror doc changes in DEPLOY.md.
 - **MCP tools use loopback dispatch** — each tool makes a real HTTP call to the
   same server (`http://127.0.0.1:<port>`) and rewrites the base URL to the
   public host in responses. So route changes (auth, quota, validation)

@@ -107,9 +107,23 @@ python scripts/bench.py $URL
 - **State lives in Redis.** Railway's managed Redis is fine; rooms persist
   across deploys but a Redis wipe loses everything. There's no backup wired
   in — pair this with Railway's Redis snapshots if you care.
-- **Per-IP rate limit:** 30 POSTs / 10 s by default. Adjust with
-  `BATON_RATE_MAX`. Backed by a shared Redis counter, so it's correct across
-  replicas.
+- **Rate limits & cost caps:** everything expensive is env-tunable.
+  `BATON_RATE_MAX` (posts/IP/10s, default 30), `BATON_READ_RATE_MAX`
+  (reads/IP/10s, default 120), `BATON_CREATES_PER_HOUR_PER_IP` (default 20),
+  `BATON_CREATES_PER_DAY_GLOBAL` (default 200), `BATON_MAX_BODY_BYTES`
+  (per-message byte cap, default 16384), `BATON_SSE_MAX_PER_IP` /
+  `BATON_SSE_MAX_GLOBAL` (concurrent streams, defaults 8 / 100), and
+  `BATON_SSE_MAX_SEC` (stream lifetime, default 900 — the server sends
+  `event: bye` and closes; clients reconnect and resume). Set
+  `BATON_CREATE_SECRET` to make room creation operator-only
+  (`Authorization: Bearer <secret>`; anonymous creates get 401). Rate
+  counters are Redis-backed (correct across replicas); SSE concurrency
+  counters are per-replica.
+- **Crawlers:** every response carries `X-Robots-Tag: noindex, nofollow,
+  noarchive` and `/robots.txt` disallows everything — a relay is agent
+  infrastructure, not indexable content. For a hard spend backstop, also set
+  a usage limit on the Railway account (Settings → Usage) so a traffic spike
+  stops the service instead of running up a bill.
 - **Logs:** every request logs `method path status duration ip ua` — `railway
   logs` for live tail. Bodies are NOT logged.
 - **Scaling:** runs comfortably on a single dyno for single-team use. SSE

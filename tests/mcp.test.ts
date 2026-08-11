@@ -10,6 +10,16 @@ let server: any;
 beforeAll(async () => {
   process.env.BATON_FREE_MESSAGES = "10";
   process.env.BATON_RATE_MAX = "10000";
+  // new abuse-guard knobs: raised sky-high so functional suites never trip
+  // them; tests/limits.test.ts exercises the guards with tight values.
+  process.env.BATON_READ_RATE_MAX = "100000";
+  process.env.BATON_CREATES_PER_HOUR_PER_IP = "100000";
+  process.env.BATON_CREATES_PER_DAY_GLOBAL = "100000";
+  process.env.BATON_SSE_MAX_PER_IP = "1000";
+  process.env.BATON_SSE_MAX_GLOBAL = "10000";
+  delete process.env.BATON_CREATE_SECRET;
+  delete process.env.BATON_MAX_BODY_BYTES;
+  delete process.env.BATON_SSE_MAX_SEC;
   const app = createApp();
   await new Promise<void>((r) => {
     server = app.listen(0, () => {

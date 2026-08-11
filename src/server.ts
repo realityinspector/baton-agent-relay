@@ -19,8 +19,24 @@ export function createApp(store: Store = makeStore()) {
   // LEFTMOST X-Forwarded-For entry, which the client controls — a spoofable
   // per-IP rate-limit key. Override hop count via BATON_TRUST_PROXY_HOPS.
   app.set("trust proxy", Number(process.env.BATON_TRUST_PROXY_HOPS ?? 1));
-  // 64kb to comfortably cover a 16k body + headers + protocol fields.
-  app.use(express.json({ limit: "64kb" }));
+
+  // --- egress & abuse knobs ---------------------------------------------------
+  // Everything that costs money on a public deployment (bytes served, rooms
+  // created, connections held open) is bounded and env-tunable, so an operator
+  // can lock a host down hard without a code change. Defaults stay permissive
+  // enough for self-hosting and local dev.
+  const BODY_MAX = Math.max(256, Number(process.env.BATON_MAX_BODY_BYTES || 16384) | 0);
+  const READ_MAX = Number(process.env.BATON_READ_RATE_MAX || 120);
+  const CREATE_SECRET = process.env.BATON_CREATE_SECRET || "";
+  const CREATES_PER_HOUR_PER_IP = Number(process.env.BATON_CREATES_PER_HOUR_PER_IP || 20);
+  const CREATES_PER_DAY_GLOBAL = Number(process.env.BATON_CREATES_PER_DAY_GLOBAL || 200);
+  const SSE_MAX_GLOBAL = Number(process.env.BATON_SSE_MAX_GLOBAL || 100);
+  const SSE_MAX_PER_IP = Number(process.env.BATON_SSE_MAX_PER_IP || 8);
+  const SSE_MAX_SEC = Math.max(1, Number(process.env.BATON_SSE_MAX_SEC || 900) | 0);
+
+  // JSON parser cap scales with the message-body cap (envelope headroom), with
+  // a floor high enough for MCP tool-call envelopes.
+  app.use(express.json({ limit: Math.max(BODY_MAX * 2, 8 * 1024) }));
 
   // request log: method path status duration ip ua (truncated)
   app.use((req, res, next) => {
@@ -43,11 +59,34 @@ export function createApp(store: Store = makeStore()) {
     next();
   });
 
+  // This relay is agent infrastructure, not web content: tell every crawler
+  // to stay out (header on all responses; robots.txt for the polite ones).
+  // Join manuals embed bearer tokens in their URLs — they must never land in
+  // a search index.
+  app.use((_req, res, next) => {
+    res.set("x-robots-tag", "noindex, nofollow, noarchive");
+    next();
+  });
+  app.get("/robots.txt", (_req, res) =>
+    res.type("text/plain").send("User-agent: *\nDisallow: /\n"));
+
+  const sha256hex = (s: string) => crypto.createHash("sha256").update(s).digest("hex");
+
+  // Read metering: GETs used to be unmetered, which made every byte of served
+  // HTML/JSON a free egress ramp for bots. Same fixed-window bucket as posts,
+  // separate (higher) cap. /healthz stays free for platform health probes.
+  app.use(async (req, res, next) => {
+    if (req.method !== "GET" && req.method !== "HEAD") return next();
+    if (req.path === "/healthz" || req.path === "/robots.txt") return next();
+    const n = await store.incrRateBucket(`read:${req.ip || "anon"}`, 10);
+    if (n > READ_MAX)
+      return res.status(429).json({ error: "rate_limited", scope: "reads", retryInSec: 10 });
+    next();
+  });
+
   const hostFor = (req: Request) =>
     process.env.PUBLIC_URL?.replace(/\/$/, "") ||
     `${req.protocol}://${req.get("host")}`;
-
-  const sha256hex = (s: string) => crypto.createHash("sha256").update(s).digest("hex");
 
   // Rate limit: shared fixed-window via store.incrRateBucket (Redis when
   // available, in-memory fallback). Window 10s; default cap 30 POSTs per IP
@@ -77,8 +116,32 @@ export function createApp(store: Store = makeStore()) {
   app.get("/mcp", handleMcpOther());
   app.delete("/mcp", handleMcpOther());
 
+  const secretsEqual = (a: string, b: string) => {
+    const ab = Buffer.from(a), bb = Buffer.from(b);
+    return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
+  };
+
   // --- create room ---
   app.post("/", async (req, res) => {
+    // Room creation is the #1 cost ramp on a public relay: every room grants
+    // freeMessages of free posting plus persistent storage. Cap it per-IP and
+    // globally — or, with BATON_CREATE_SECRET set, gate it entirely so only
+    // the operator (Authorization: Bearer <secret>) can create rooms.
+    const bearerMatch = /^Bearer\s+(.+)$/i.exec(req.header("authorization") || "");
+    const isOperator = !!CREATE_SECRET && !!bearerMatch && secretsEqual(bearerMatch[1], CREATE_SECRET);
+    if (CREATE_SECRET && !isOperator)
+      return res.status(401).json({
+        error: "room_creation_requires_operator_secret",
+        hint: "this relay gates room creation; send Authorization: Bearer <operator secret>",
+      });
+    if (!isOperator) {
+      const perIp = await store.incrRateBucket(`create:ip:${req.ip || "anon"}`, 3600);
+      if (perIp > CREATES_PER_HOUR_PER_IP)
+        return res.status(429).json({ error: "room_creation_rate_limited", scope: "ip_hour", max: CREATES_PER_HOUR_PER_IP });
+      const global = await store.incrRateBucket("create:global", 86400);
+      if (global > CREATES_PER_DAY_GLOBAL)
+        return res.status(429).json({ error: "room_creation_rate_limited", scope: "global_day", max: CREATES_PER_DAY_GLOBAL });
+    }
     const isPrivate = req.query.private === "1" || req.query.private === "true";
     const isSigned = req.query.signed === "1" || req.query.signed === "true";
     const isAttest = req.query.attest === "1" || req.query.attest === "true";
@@ -426,8 +489,44 @@ export function createApp(store: Store = makeStore()) {
     res.json({ slug: ctx.slug, _meta: { ...envelopeMeta(room), currentPrevId, currentPrevHash }, messages });
   });
 
+  // In-process SSE bookkeeping. Concurrency caps are per-replica (fine for a
+  // single-replica deploy); the lifetime cap guarantees no connection can be
+  // held open forever. Clients reconnect and resume via Last-Event-ID/?since=,
+  // so a lifetime cut loses nothing.
+  let sseOpen = 0;
+  const sseOpenByIp = new Map<string, number>();
+
   app.get("/r/:slug/messages", async (req, res) => {
     const ctx = await loadRoom(req, res); if (!ctx) return;
+    const ip = req.ip || "anon";
+    const mine = sseOpenByIp.get(ip) || 0;
+    if (sseOpen >= SSE_MAX_GLOBAL || mine >= SSE_MAX_PER_IP)
+      return res.status(429).json({
+        error: "too_many_streams",
+        hint: "concurrent SSE cap reached; use long-poll GET .../messages.json?wait=30 or retry shortly",
+      });
+    sseOpen++; sseOpenByIp.set(ip, mine + 1);
+
+    let unsub: () => void = () => {};
+    const ka = setInterval(() => res.write(`: keepalive\n\n`), 25_000);
+    // Hard lifetime cap: end the stream after SSE_MAX_SEC. The `bye` frame
+    // tells well-behaved clients to reconnect (browsers' EventSource and the
+    // dashboard do so automatically; curl users re-run the command).
+    const lifetime = setTimeout(() => {
+      try { res.write(`event: bye\ndata: {"reason":"stream_lifetime_reached","reconnect":true}\n\n`); } catch { /* already gone */ }
+      res.end();
+    }, SSE_MAX_SEC * 1000);
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      clearInterval(ka); clearTimeout(lifetime); unsub();
+      sseOpen--;
+      const n = (sseOpenByIp.get(ip) || 1) - 1;
+      if (n <= 0) sseOpenByIp.delete(ip); else sseOpenByIp.set(ip, n);
+    };
+    req.on("close", release);
+
     res.set({
       "content-type": "text/event-stream",
       "cache-control": "no-cache, no-transform",
@@ -449,11 +548,11 @@ export function createApp(store: Store = makeStore()) {
     // reconnect — closes the gap where a SSE consumer dropped a message
     // during a network hiccup.
     for (const m of backlog) res.write(`id: ${m.id}\nevent: message\ndata: ${JSON.stringify(m)}\n\n`);
-    const unsub = await store.subscribe(ctx.slug, (m) => {
+    unsub = await store.subscribe(ctx.slug, (m) => {
       res.write(`id: ${m.id}\nevent: message\ndata: ${JSON.stringify(m)}\n\n`);
     });
-    const ka = setInterval(() => res.write(`: keepalive\n\n`), 25_000);
-    req.on("close", () => { clearInterval(ka); unsub(); });
+    // client may have vanished while we were subscribing — don't leak the sub
+    if (released) unsub();
   });
 
   // --- post message (with x402 quota) ---
@@ -467,12 +566,12 @@ export function createApp(store: Store = makeStore()) {
     // HMAC verify and storage are raw JSON-parsed strings, never normalized.
     if (typeof from !== "string" || from.trim().length === 0 || from.length > 64 || from.includes("|"))
       return res.status(400).json({ error: "bad_from" });
-    // 16 KiB body limit — generous for LLM-shaped messages (HANDOFF docs,
-    // structured responses, code snippets) but still bounded. JSON parser
-    // limit is 32 KiB above; keeping body strictly less leaves headroom for
-    // the rest of the JSON envelope.
-    if (typeof body !== "string" || body.trim().length === 0 || body.length > 16384)
-      return res.status(400).json({ error: "bad_body", limit: 16384, got: typeof body === "string" ? body.length : null });
+    // Body cap: default 16 KiB (generous for LLM-shaped messages — HANDOFF
+    // docs, structured responses, code snippets) but env-tunable down to
+    // "bits not bytes" via BATON_MAX_BODY_BYTES for cost-capped public hosts.
+    // The JSON parser limit above scales with it, leaving envelope headroom.
+    if (typeof body !== "string" || body.trim().length === 0 || body.length > BODY_MAX)
+      return res.status(400).json({ error: "bad_body", limit: BODY_MAX, got: typeof body === "string" ? body.length : null });
     if (reply_to !== undefined && (typeof reply_to !== "number" || !Number.isInteger(reply_to) || reply_to < 1))
       return res.status(400).json({ error: "bad_reply_to" });
 

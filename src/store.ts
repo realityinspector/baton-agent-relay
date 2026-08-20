@@ -16,6 +16,12 @@ export type Message = {
 
 export type RoomMode = "public" | "private" | "signed" | "attest";
 
+// Service tier. A room is stamped "power" at creation when the creator
+// presented a valid BATON_POWER_KEYS secret; the stamp is what everyone who
+// later joins inherits, so a guest with only a join link gets the roomier
+// body cap and post quota without ever holding the operator's key.
+export type RoomTier = "free" | "power";
+
 export type Room = {
   slug: string;
   createdAt: number;
@@ -26,6 +32,9 @@ export type Room = {
   // produce client-side. The server only stores a `encrypted` flag and
   // enforces that bodies carry the `enc:v1:` prefix — it never holds the key.
   encrypted?: boolean;
+  // "power" rooms carry raised body/quota limits for every participant.
+  // Absent on rooms created before tiers existed — treat as "free".
+  tier?: RoomTier;
   // bearer secret (private rooms) and signing key (signed rooms) are stored
   // separately and never returned after creation.
 };
@@ -48,6 +57,7 @@ export interface Store {
     isEncrypted: boolean,
     secret?: string,
     signingKey?: string,
+    tier?: RoomTier,
   ): Promise<void>;
   getRoom(slug: string): Promise<Room | null>;
   getRoomSecret(slug: string): Promise<string | null>;
@@ -106,9 +116,9 @@ class MemoryStore implements Store {
   userTokens = new Map<string, Map<string, { label: string; createdAt: number; handle: string }>>(); // slug -> authKey -> meta
   claimCodes = new Map<string, { label: string; expires: number }>(); // `${slug}:${code}` -> meta
 
-  async createRoom(slug: string, isPrivate: boolean, isSigned: boolean, isAttest: boolean, isEncrypted: boolean, secret?: string, signingKey?: string) {
+  async createRoom(slug: string, isPrivate: boolean, isSigned: boolean, isAttest: boolean, isEncrypted: boolean, secret?: string, signingKey?: string, tier: RoomTier = "free") {
     if (this.rooms.has(slug)) throw new Error("collision");
-    this.rooms.set(slug, { slug, createdAt: Date.now(), private: isPrivate, signed: isSigned, attest: isAttest, encrypted: isEncrypted });
+    this.rooms.set(slug, { slug, createdAt: Date.now(), private: isPrivate, signed: isSigned, attest: isAttest, encrypted: isEncrypted, tier });
     if (secret) this.secrets.set(slug, secret);
     if (signingKey) this.signingKeys.set(slug, signingKey);
     this.messages.set(slug, []);
@@ -254,9 +264,9 @@ class RedisStore implements Store {
     utokens: (s: string) => `baton:utokens:${s}`, // hash: authKey -> {label,createdAt,handle}
     claim: (s: string, c: string) => `baton:claim:${s}:${c}`,
   };
-  async createRoom(slug: string, isPrivate: boolean, isSigned: boolean, isAttest: boolean, isEncrypted: boolean, secret?: string, signingKey?: string) {
+  async createRoom(slug: string, isPrivate: boolean, isSigned: boolean, isAttest: boolean, isEncrypted: boolean, secret?: string, signingKey?: string, tier: RoomTier = "free") {
     const ok = await this.cmd.setnx(this.k.room(slug), JSON.stringify({
-      slug, createdAt: Date.now(), private: isPrivate, signed: isSigned, attest: isAttest, encrypted: isEncrypted,
+      slug, createdAt: Date.now(), private: isPrivate, signed: isSigned, attest: isAttest, encrypted: isEncrypted, tier,
     }));
     if (!ok) throw new Error("collision");
     if (secret) await this.cmd.set(this.k.secret(slug), secret);
@@ -270,6 +280,8 @@ class RedisStore implements Store {
     if (typeof (r as any).signed !== "boolean") (r as any).signed = false;
     if (typeof (r as any).attest !== "boolean") (r as any).attest = false;
     if (typeof (r as any).encrypted !== "boolean") (r as any).encrypted = false;
+    // rooms created before tiers existed are free-tier
+    if (r.tier !== "power") r.tier = "free";
     return r;
   }
   async getRoomSecret(slug: string) {

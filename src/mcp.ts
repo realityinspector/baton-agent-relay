@@ -205,6 +205,10 @@ async function loopback(
   if (opts.body !== undefined) headers["content-type"] = "application/json";
   if (opts.bearer) headers["authorization"] = `Bearer ${opts.bearer}`;
   if (req.ip) headers["x-forwarded-for"] = req.ip;
+  // Forward the power-tier key so an MCP client that holds one creates power
+  // rooms and posts at power limits, exactly as it would over raw HTTP.
+  const powerKey = req.header("x-baton-key");
+  if (powerKey) headers["x-baton-key"] = powerKey;
   const r = await fetch(base + path, {
     method,
     headers,

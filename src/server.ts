@@ -1,6 +1,6 @@
 import express, { Request, Response, NextFunction } from "express";
 import crypto from "node:crypto";
-import { makeStore, Store, Message, Room } from "./store.js";
+import { makeStore, Store, Message, Room, RoomTier } from "./store.js";
 import { randomSlug, SLUG_RE } from "./slugs.js";
 import { landingHtml, roomHtml, rootAgentsMd, roomAgentsMd, joinManual } from "./docs.js";
 import { handleMcpPost, handleMcpOther } from "./mcp.js";
@@ -34,9 +34,69 @@ export function createApp(store: Store = makeStore()) {
   const SSE_MAX_PER_IP = Number(process.env.BATON_SSE_MAX_PER_IP || 8);
   const SSE_MAX_SEC = Math.max(1, Number(process.env.BATON_SSE_MAX_SEC || 900) | 0);
 
+  // --- power tier -------------------------------------------------------------
+  // One deployment serves both audiences. Anonymous traffic gets the tight
+  // caps above; an operator-issued key in `X-Baton-Key` gets the roomier set
+  // below. Unset BATON_POWER_KEYS = nobody is a power user and this host
+  // behaves exactly as it did before tiers existed.
+  //
+  // The key travels in a header, never a query string: this server logs
+  // req.originalUrl on every request, so a `?key=` form would write the
+  // operator's credential into the logs of its own access log.
+  const POWER_KEYS = (process.env.BATON_POWER_KEYS || "")
+    .split(",").map(k => k.trim()).filter(Boolean);
+  const POWER = {
+    freeMessages: Number(process.env.BATON_POWER_FREE_MESSAGES || 1_000_000),
+    bodyMax: Math.max(256, Number(process.env.BATON_POWER_MAX_BODY_BYTES || 1_048_576) | 0),
+    rateMax: Number(process.env.BATON_POWER_RATE_MAX || 100_000),
+    readMax: Number(process.env.BATON_POWER_READ_RATE_MAX || 100_000),
+    ssePerIp: Number(process.env.BATON_POWER_SSE_MAX_PER_IP || 500),
+    sseMaxSec: Math.max(1, Number(process.env.BATON_POWER_SSE_MAX_SEC || 86_400) | 0),
+    createsPerHour: Number(process.env.BATON_POWER_CREATES_PER_HOUR || 2_000),
+  };
+
+  // Timing-safe membership test for the presented key. Compared against every
+  // configured key (no early return on length mismatch leaking which key was
+  // close) — the list is short and this runs once per request at most.
+  const isPowerReq = (req: Request): boolean => {
+    const presented = req.header("x-baton-key");
+    if (!presented || POWER_KEYS.length === 0) return false;
+    const pb = Buffer.from(presented);
+    let hit = false;
+    for (const k of POWER_KEYS) {
+      const kb = Buffer.from(k);
+      if (kb.length === pb.length && crypto.timingSafeEqual(kb, pb)) hit = true;
+    }
+    return hit;
+  };
+
+  // Effective limits INSIDE a room. Deliberately a function of the room's
+  // stamp alone, not of who is asking: a room is a shared channel, and its
+  // advertised body cap and post quota must mean the same thing for every
+  // participant. A key holder posting into someone else's free room therefore
+  // gets free-room limits — the key governs what you can create and how fast
+  // you can read (handled at those call sites), not what a room already is.
+  const limitsFor = (roomTier?: RoomTier) => {
+    const power = roomTier === "power";
+    return {
+      power,
+      freeMessages: power ? POWER.freeMessages : x402Config().freeMessages,
+      bodyMax: power ? POWER.bodyMax : BODY_MAX,
+      rateMax: power ? POWER.rateMax : RATE_MAX,
+      ssePerIp: power ? POWER.ssePerIp : SSE_MAX_PER_IP,
+      sseMaxSec: power ? POWER.sseMaxSec : SSE_MAX_SEC,
+    };
+  };
+
   // JSON parser cap scales with the message-body cap (envelope headroom), with
-  // a floor high enough for MCP tool-call envelopes.
-  app.use(express.json({ limit: Math.max(BODY_MAX * 2, 8 * 1024) }));
+  // a floor high enough for MCP tool-call envelopes. When a power tier is
+  // configured the envelope must fit a power-sized body too — the parser runs
+  // before routing, so it can't yet know the target room's tier. Anonymous
+  // oversize posts are still refused, just at the route (`bad_body`) rather
+  // than by the parser.
+  app.use(express.json({
+    limit: Math.max(POWER_KEYS.length ? POWER.bodyMax * 2 : 0, BODY_MAX * 2, 8 * 1024),
+  }));
 
   // request log: method path status duration ip ua (truncated)
   app.use((req, res, next) => {
@@ -79,7 +139,9 @@ export function createApp(store: Store = makeStore()) {
     if (req.method !== "GET" && req.method !== "HEAD") return next();
     if (req.path === "/healthz" || req.path === "/robots.txt") return next();
     const n = await store.incrRateBucket(`read:${req.ip || "anon"}`, 10);
-    if (n > READ_MAX)
+    // Reads are metered before routing, so the room's tier isn't known yet —
+    // only the presented key can lift this one.
+    if (n > (isPowerReq(req) ? POWER.readMax : READ_MAX))
       return res.status(429).json({ error: "rate_limited", scope: "reads", retryInSec: 10 });
     next();
   });
@@ -94,9 +156,9 @@ export function createApp(store: Store = makeStore()) {
   // unmetered. Cross-replica correct.
   const RATE_WINDOW_SEC = 10;
   const RATE_MAX = Number(process.env.BATON_RATE_MAX || 30);
-  async function rateExceeded(ip: string): Promise<boolean> {
+  async function rateExceeded(ip: string, max: number = RATE_MAX): Promise<boolean> {
     const n = await store.incrRateBucket(`ip:${ip}`, RATE_WINDOW_SEC);
-    return n > RATE_MAX;
+    return n > max;
   }
 
   // --- landing & root manual ---
@@ -134,13 +196,21 @@ export function createApp(store: Store = makeStore()) {
         error: "room_creation_requires_operator_secret",
         hint: "this relay gates room creation; send Authorization: Bearer <operator secret>",
       });
+    // Power users create at their own (higher) per-IP ceiling and are exempt
+    // from the global daily cap — that cap exists to bound anonymous cost, and
+    // letting public traffic starve the operator out of their own relay would
+    // defeat the point of holding a key.
+    const isPower = isPowerReq(req);
     if (!isOperator) {
+      const perIpMax = isPower ? POWER.createsPerHour : CREATES_PER_HOUR_PER_IP;
       const perIp = await store.incrRateBucket(`create:ip:${req.ip || "anon"}`, 3600);
-      if (perIp > CREATES_PER_HOUR_PER_IP)
-        return res.status(429).json({ error: "room_creation_rate_limited", scope: "ip_hour", max: CREATES_PER_HOUR_PER_IP });
-      const global = await store.incrRateBucket("create:global", 86400);
-      if (global > CREATES_PER_DAY_GLOBAL)
-        return res.status(429).json({ error: "room_creation_rate_limited", scope: "global_day", max: CREATES_PER_DAY_GLOBAL });
+      if (perIp > perIpMax)
+        return res.status(429).json({ error: "room_creation_rate_limited", scope: "ip_hour", max: perIpMax });
+      if (!isPower) {
+        const global = await store.incrRateBucket("create:global", 86400);
+        if (global > CREATES_PER_DAY_GLOBAL)
+          return res.status(429).json({ error: "room_creation_rate_limited", scope: "global_day", max: CREATES_PER_DAY_GLOBAL });
+      }
     }
     const isPrivate = req.query.private === "1" || req.query.private === "true";
     const isSigned = req.query.signed === "1" || req.query.signed === "true";
@@ -154,11 +224,14 @@ export function createApp(store: Store = makeStore()) {
       return res.status(400).json({ error: "attest_and_signed_are_mutually_exclusive" });
     const secret = isPrivate ? crypto.randomBytes(24).toString("base64url") : undefined;
     const signingKey = isSigned ? crypto.randomBytes(32).toString("base64url") : undefined;
+    // The tier is stamped once, here. Everyone who later joins this room
+    // inherits it, key or no key.
+    const tier: RoomTier = isPower ? "power" : "free";
 
     let slug = "", attempts = 0;
     while (attempts++ < 16) {
       slug = randomSlug();
-      try { await store.createRoom(slug, isPrivate, isSigned, isAttest, isEncrypted, secret, signingKey); break; }
+      try { await store.createRoom(slug, isPrivate, isSigned, isAttest, isEncrypted, secret, signingKey, tier); break; }
       catch { slug = ""; }
     }
     if (!slug) return res.status(500).json({ error: "slug_exhausted" });
@@ -194,7 +267,9 @@ export function createApp(store: Store = makeStore()) {
       signed: isSigned,
       attest: isAttest,
       encrypted: isEncrypted,
-      freeMessages: x402Config().freeMessages,
+      tier,
+      freeMessages: isPower ? POWER.freeMessages : x402Config().freeMessages,
+      maxBodyBytes: isPower ? POWER.bodyMax : BODY_MAX,
       authNote,
     };
     if (encryptionNote) body.encryptionNote = encryptionNote;
@@ -419,7 +494,8 @@ export function createApp(store: Store = makeStore()) {
     if (!ok) return res.status(404).send("invalid or revoked join link");
     res.set("cache-control", "no-store, no-cache, must-revalidate, private");
     res.type("text/markdown; charset=utf-8")
-       .send(joinManual(hostFor(req), slug, token, !!room.encrypted, "another agent", x402Config().freeMessages));
+       .send(joinManual(hostFor(req), slug, token, !!room.encrypted, "another agent",
+                        room.tier === "power" ? POWER.freeMessages : x402Config().freeMessages));
   });
 
   app.get("/r/:slug", async (req, res) => {
@@ -436,7 +512,8 @@ export function createApp(store: Store = makeStore()) {
     const room = await store.getRoom(slug);
     if (!room) return res.status(404).send("not found");
     res.type("text/markdown; charset=utf-8")
-       .send(roomAgentsMd(hostFor(req), slug, x402Config().freeMessages));
+       .send(roomAgentsMd(hostFor(req), slug,
+                          room.tier === "power" ? POWER.freeMessages : x402Config().freeMessages));
   });
 
   // envelope decoration: every message-feed response includes _meta so the
@@ -453,6 +530,7 @@ export function createApp(store: Store = makeStore()) {
       signed: room.signed,
       attest: !!room.attest,
       encrypted: !!room.encrypted,
+      tier: room.tier ?? "free",
       confidentiality: room.encrypted
         ? "end-to-end: bodies are `enc:v1:` ciphertext; the relay cannot read them. `from`/ids/timestamps remain cleartext metadata."
         : "none: bodies are stored and served in cleartext (TLS in transit only).",
@@ -498,9 +576,11 @@ export function createApp(store: Store = makeStore()) {
 
   app.get("/r/:slug/messages", async (req, res) => {
     const ctx = await loadRoom(req, res); if (!ctx) return;
+    const sseRoom = await store.getRoom(ctx.slug);
+    const sseLim = limitsFor(sseRoom?.tier);
     const ip = req.ip || "anon";
     const mine = sseOpenByIp.get(ip) || 0;
-    if (sseOpen >= SSE_MAX_GLOBAL || mine >= SSE_MAX_PER_IP)
+    if (sseOpen >= SSE_MAX_GLOBAL || mine >= sseLim.ssePerIp)
       return res.status(429).json({
         error: "too_many_streams",
         hint: "concurrent SSE cap reached; use long-poll GET .../messages.json?wait=30 or retry shortly",
@@ -515,7 +595,7 @@ export function createApp(store: Store = makeStore()) {
     const lifetime = setTimeout(() => {
       try { res.write(`event: bye\ndata: {"reason":"stream_lifetime_reached","reconnect":true}\n\n`); } catch { /* already gone */ }
       res.end();
-    }, SSE_MAX_SEC * 1000);
+    }, sseLim.sseMaxSec * 1000);
     let released = false;
     const release = () => {
       if (released) return;
@@ -558,7 +638,11 @@ export function createApp(store: Store = makeStore()) {
   // --- post message (with x402 quota) ---
   app.post("/r/:slug", async (req, res) => {
     const ctx = await loadRoom(req, res); if (!ctx) return;
-    if (await rateExceeded(req.ip || "anon"))
+    // Tier is resolved from the room before any limit is applied, so a guest
+    // posting into a power room gets power limits without holding a key.
+    const roomForTier = await store.getRoom(ctx.slug);
+    const lim = limitsFor(roomForTier?.tier);
+    if (await rateExceeded(req.ip || "anon", lim.rateMax))
       return res.status(429).json({ error: "rate_limited" });
 
     const { from, body, reply_to } = (req.body || {}) as { from?: string; body?: string; reply_to?: number };
@@ -570,8 +654,8 @@ export function createApp(store: Store = makeStore()) {
     // docs, structured responses, code snippets) but env-tunable down to
     // "bits not bytes" via BATON_MAX_BODY_BYTES for cost-capped public hosts.
     // The JSON parser limit above scales with it, leaving envelope headroom.
-    if (typeof body !== "string" || body.trim().length === 0 || body.length > BODY_MAX)
-      return res.status(400).json({ error: "bad_body", limit: BODY_MAX, got: typeof body === "string" ? body.length : null });
+    if (typeof body !== "string" || body.trim().length === 0 || body.length > lim.bodyMax)
+      return res.status(400).json({ error: "bad_body", limit: lim.bodyMax, got: typeof body === "string" ? body.length : null });
     if (reply_to !== undefined && (typeof reply_to !== "number" || !Number.isInteger(reply_to) || reply_to < 1))
       return res.status(400).json({ error: "bad_reply_to" });
 
@@ -587,7 +671,6 @@ export function createApp(store: Store = makeStore()) {
       });
     }
 
-    const cfg = x402Config();
     const count = await store.messageCount(ctx.slug);
 
     if (reply_to !== undefined && reply_to > count)
@@ -698,7 +781,7 @@ export function createApp(store: Store = makeStore()) {
       attestSig = sigHdr.toLowerCase();
     }
 
-    if (count >= cfg.freeMessages) {
+    if (count >= lim.freeMessages) {
       const resourceUrl = `${hostFor(req)}/r/${ctx.slug}`;
       const requirement = buildRequirement(
         resourceUrl,
@@ -755,7 +838,7 @@ export function createApp(store: Store = makeStore()) {
     const msg: Message = await store.appendMessage(ctx.slug, msgPayload);
     await store.publish(ctx.slug, msg);
 
-    const remaining = Math.max(0, cfg.freeMessages - (count + 1));
+    const remaining = Math.max(0, lim.freeMessages - (count + 1));
     const respBody: Record<string, unknown> = { ok: true, message: msg, freeMessagesRemaining: remaining };
     if (remaining <= 2) {
       respBody.quotaWarning = remaining === 0

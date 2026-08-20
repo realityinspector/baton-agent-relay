@@ -226,4 +226,11 @@ describe("served manuals mention MCP", () => {
     expect(t).toContain("room_creation_rate_limited");
     expect(t).toContain("event: bye");
   });
+
+  it("root AGENTS.md explains the power tier and how the stamp is inherited", async () => {
+    const t = await (await fetch(`${base}/AGENTS.md`)).text();
+    expect(t).toContain("## Power tier");
+    expect(t).toContain("X-Baton-Key");
+    expect(t).toContain("without\nthem needing the key");
+  });
 });

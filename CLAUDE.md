@@ -53,15 +53,22 @@ extra (`[ed25519]` / `[encrypt]`) needed only for attest and encrypted modes.
 
 ## Deploy
 
-Railway project `baton-relay`, service `baton-app`:
+Railway. This repo is public, so the maintainer's project/service names and
+every deployed variable value are deliberately kept OUT of the tree — read
+them from `railway status` / `railway variables` against your own linked
+service, not from a doc:
 
 ```bash
-railway up --service baton-app --ci
+railway up --service <your-service> --ci
 ```
 
-Wait for `Deploy complete`, then curl the live host to verify. The server reads
-`PORT`; locally prefer an explicit `PORT=43xx node dist/server.js` because 3000
-is sometimes occupied by another app on this machine.
+Wait for `Deploy complete`, then curl your host to verify. Note that a
+variable change alone does **not** reach the running instance — `railway
+redeploy` kept serving the old env in practice; do a real `railway up` after
+setting variables, and verify the new value actually took effect rather than
+assuming it did. The server reads `PORT`; locally prefer an explicit
+`PORT=43xx node dist/server.js` because 3000 is sometimes occupied by another
+app on this machine.
 
 ## Trust modes (orthogonal — combine except attest+signed)
 
@@ -101,6 +108,17 @@ Revoking the token makes the link 404.
 - Keep `README.md`, `QUICKSTART.md`, `AGENTS.md`, and `clients/python/README.md`
   in sync when you add a feature; the served root manual lives in `docs.ts`
   (`rootAgentsMd`), separate from the repo-root `AGENTS.md`.
+- **Two tiers, one host** — `BATON_POWER_KEYS` (comma-separated) turns a
+  deployment into a public relay *and* a power-user relay. Key travels in the
+  `X-Baton-Key` header (never a query string — the request logger writes full
+  URLs). Rooms are **stamped** `tier: "free" | "power"` at creation and the
+  stamp is authoritative for in-room limits (body cap, quota, SSE lifetime),
+  so join-link guests inherit power without the key and a key never upgrades
+  someone else's room. The key itself governs creation caps and read metering.
+  Power overrides are `BATON_POWER_*` (see DEPLOY.md); `tests/tiers.test.ts`
+  owns the coverage. Note `x402Config()` reads `BATON_FREE_MESSAGES` lazily
+  per-request, so a test harness must hold env for the server's lifetime, not
+  just across `createApp()`.
 - **Abuse guards are env knobs** — `BATON_READ_RATE_MAX`,
   `BATON_CREATES_PER_HOUR_PER_IP`, `BATON_CREATES_PER_DAY_GLOBAL`,
   `BATON_CREATE_SECRET` (operator-only creation), `BATON_MAX_BODY_BYTES`,

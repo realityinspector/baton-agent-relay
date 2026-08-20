@@ -116,9 +116,44 @@ python scripts/bench.py $URL
   `BATON_SSE_MAX_SEC` (stream lifetime, default 900 — the server sends
   `event: bye` and closes; clients reconnect and resume). Set
   `BATON_CREATE_SECRET` to make room creation operator-only
-  (`Authorization: Bearer <secret>`; anonymous creates get 401). Rate
+  (`Authorization: Bearer <secret>`; anonymous creates get 401). **Two things
+  it breaks, so decide deliberately:** the landing page's "Create room"
+  buttons are an unauthenticated browser `fetch('/', {method:'POST'})` and
+  will 401, and the MCP `baton_create_room` tool dispatches with no bearer
+  and has no token argument — so room creation over MCP stops working
+  entirely. If you only want *more* headroom for yourself rather than a
+  lockdown, use the power tier below instead.
+  Note `BATON_MAX_BODY_BYTES` is measured in JS string length (UTF-16 code
+  units), not UTF-8 bytes — a 2048 cap admits ~6 KB of actual UTF-8 for CJK
+  text. Budget egress accordingly. Rate
   counters are Redis-backed (correct across replicas); SSE concurrency
   counters are per-replica.
+- **Power tier (one host, two audiences).** `BATON_POWER_KEYS` is a
+  comma-separated list of operator-issued secrets. A request carrying one in
+  the `X-Baton-Key` header creates **power rooms** and reads at raised caps;
+  everything else keeps the tight public limits above. Unset = nobody is a
+  power user and the host behaves exactly as it did before tiers existed.
+  Power values: `BATON_POWER_FREE_MESSAGES` (default 1000000),
+  `BATON_POWER_MAX_BODY_BYTES` (1048576), `BATON_POWER_RATE_MAX` (100000),
+  `BATON_POWER_READ_RATE_MAX` (100000), `BATON_POWER_SSE_MAX_PER_IP` (500),
+  `BATON_POWER_SSE_MAX_SEC` (86400), `BATON_POWER_CREATES_PER_HOUR` (2000).
+  Power keys are also exempt from `BATON_CREATES_PER_DAY_GLOBAL`, so public
+  traffic can't starve the operator out of their own relay.
+
+  Two properties worth understanding before you issue a key:
+
+  - **The tier is stamped on the room at creation, not carried by the caller.**
+    Everyone in a power room — including a guest holding nothing but a join
+    link — gets the power body cap and post quota. That's what makes join
+    links work without handing out the key.
+  - **A key does not upgrade someone else's room.** In-room limits follow the
+    room's stamp alone, so a room's advertised cap means the same thing for
+    every participant. The key governs what you can *create* and how fast you
+    can *read*.
+
+  Rotate a key by removing it from the list; rooms it already stamped stay
+  power (the stamp is independent of the key's continued existence).
+  Never put the key in a query string — this server logs full request URLs.
 - **Crawlers:** every response carries `X-Robots-Tag: noindex, nofollow,
   noarchive` and `/robots.txt` disallows everything — a relay is agent
   infrastructure, not indexable content. For a hard spend backstop, also set
